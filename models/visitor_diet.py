@@ -47,11 +47,13 @@ class DietOrderCreate(BaseModel):
     diet_type: str = Field(..., description="regular, diabetic, liquid, low_sodium, soft, npo")
     special_instructions: Optional[str] = None
     delivery_time: Optional[str] = None
+    price: Optional[float] = 0.0
 
 
 class DietOrderUpdate(BaseModel):
     status: Optional[str] = None  # ordered, preparing, prepared, delivered
     special_instructions: Optional[str] = None
+    price: Optional[float] = None
 
 
 class DietOrderResponse(BaseModel):
@@ -65,6 +67,8 @@ class DietOrderResponse(BaseModel):
     diet_type: str
     special_instructions: Optional[str] = None
     delivery_time: Optional[str] = None
+    price: float = 0.0
+    created_by_role: Optional[str] = "staff"
     status: str
     created_at: datetime
     updated_at: datetime

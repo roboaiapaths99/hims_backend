@@ -184,6 +184,9 @@ async def initialize_payment(
 
     branch = await branches_col.find_one({"_id": invoice["branch_id"]})
     pay_settings = branch.get("payment_settings") or {} if branch else {}
+    
+    from services.secrets_vault import get_branch_secrets
+    branch_secrets = await get_branch_secrets(invoice["branch_id"])
 
     # Calculate balance due
     payments_col = get_payments_collection()
@@ -224,7 +227,7 @@ async def initialize_payment(
     if method == "payu":
         # Generate hash parameter payloads
         key = pay_settings.get("payu_merchant_key") or settings.PAYU_MERCHANT_KEY or "gtK42w"
-        salt = pay_settings.get("payu_merchant_salt") or settings.PAYU_MERCHANT_SALT or "eCwWELSp"
+        salt = branch_secrets.get("payu_merchant_salt") or settings.PAYU_MERCHANT_SALT or "eCwWELSp"
         env = pay_settings.get("payu_env") or settings.PAYU_ENV or "test"
         
         action_url = "https://secure.payu.in/_payment" if env == "production" else "https://test.payu.in/_payment"
@@ -253,7 +256,7 @@ async def initialize_payment(
 
     elif method == "razorpay":
         key_id = pay_settings.get("razorpay_key_id") or "rzp_test_placeholderKey"
-        key_secret = pay_settings.get("razorpay_key_secret")
+        key_secret = branch_secrets.get("razorpay_key_secret")
         
         order_id = None
         if key_secret and not key_id.startswith("rzp_test_placeholder"):
@@ -277,7 +280,7 @@ async def initialize_payment(
 
     elif method == "stripe":
         publishable_key = pay_settings.get("stripe_publishable_key") or "pk_test_placeholderKey"
-        secret_key = pay_settings.get("stripe_secret_key")
+        secret_key = branch_secrets.get("stripe_secret_key")
         
         client_secret = None
         if secret_key and not publishable_key.startswith("pk_test_placeholder"):
@@ -345,11 +348,15 @@ async def verify_payment(
     details = {}
 
     # Load branch settings to get secret keys
+    branches_col = get_branches_collection()
     branch = await branches_col.find_one({"_id": invoice["branch_id"]})
     pay_settings = branch.get("payment_settings") or {} if branch else {}
+    
+    from services.secrets_vault import get_branch_secrets
+    branch_secrets = await get_branch_secrets(invoice["branch_id"])
 
     if method == "razorpay":
-        key_secret = pay_settings.get("razorpay_key_secret")
+        key_secret = branch_secrets.get("razorpay_key_secret")
         if key_secret and payload.extra_data and "razorpay_signature" in payload.extra_data:
             order_id = payload.extra_data.get("razorpay_order_id", "")
             payment_id = payload.transaction_id
@@ -372,7 +379,7 @@ async def verify_payment(
             details = {"razorpay_payment_id": payload.transaction_id, "mode": "sandbox"}
         
     elif method == "stripe":
-        secret_key = pay_settings.get("stripe_secret_key")
+        secret_key = branch_secrets.get("stripe_secret_key")
         if secret_key and not secret_key.startswith("sk_test_placeholder"):
             intent_id = payload.transaction_id
             is_succeeded = await verify_real_stripe_intent(secret_key, intent_id)
@@ -482,3 +489,60 @@ async def verify_payment(
         "payment_id": payment_id,
         "invoice_status": new_status
     }
+
+@router.get("/payu/success")
+async def payu_success_page(invoice_id: Optional[str] = None, txnid: Optional[str] = None):
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(
+        content="""
+        <html>
+            <head>
+                <title>Payment Successful</title>
+                <style>
+                    body { font-family: sans-serif; text-align: center; padding: 50px; background-color: #f8fafc; }
+                    .card { background: white; padding: 40px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+                    h1 { color: #0d9488; }
+                    p { color: #475569; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h1>✔ Payment Successful</h1>
+                    <p>Your payment has been successfully processed and verified.</p>
+                    <p>Transaction ID: """ + (txnid or 'N/A') + """</p>
+                    <p>You can close this window or return to the application.</p>
+                </div>
+            </body>
+        </html>
+        """,
+        status_code=200
+    )
+
+@router.get("/payu/fail")
+async def payu_fail_page(invoice_id: Optional[str] = None, txnid: Optional[str] = None, message: Optional[str] = None):
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(
+        content="""
+        <html>
+            <head>
+                <title>Payment Failed</title>
+                <style>
+                    body { font-family: sans-serif; text-align: center; padding: 50px; background-color: #f8fafc; }
+                    .card { background: white; padding: 40px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+                    h1 { color: #dc2626; }
+                    p { color: #475569; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h1>❌ Payment Failed</h1>
+                    <p>We were unable to process your payment.</p>
+                    <p>Reason: """ + (message or 'Transaction was cancelled or failed') + """</p>
+                    <p>Transaction ID: """ + (txnid or 'N/A') + """</p>
+                    <p>Please try again or contact support.</p>
+                </div>
+            </body>
+        </html>
+        """,
+        status_code=200
+    )

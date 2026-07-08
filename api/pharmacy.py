@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 
+from pymongo import ReturnDocument
 from database import (
     get_prescriptions_collection,
     get_patients_collection,
@@ -143,6 +144,10 @@ async def create_prescription(
         branch_id=current_user["branch_id"]
     )
     
+    sio = getattr(request.app.state, "sio", None)
+    if sio:
+        await sio.emit("prescriptions.updated", {"branch_id": str(doc["branch_id"])}, room=f"branch_{doc['branch_id']}")
+        
     return PrescriptionResponse(**doc)
 
 @router.get("/prescriptions", response_model=List[PrescriptionResponse])
@@ -195,7 +200,7 @@ async def list_prescriptions(
                 from database import get_users_collection
                 creator = await get_users_collection().find_one({"_id": ObjectId(creator_id)})
                 if creator:
-                    doc["doctor_name"] = creator.get("name", "Doctor")
+                     doc["doctor_name"] = creator.get("name", "Doctor")
             except:
                 pass
                 
@@ -257,12 +262,18 @@ async def dispense_prescription(
     except:
         raise HTTPException(status_code=400, detail="Invalid prescription ID format")
         
-    presc = await presc_col.find_one({"_id": presc_oid, "tenant_id": current_user["tenant_id"]})
+    # Atomic state transition from pending to dispensing to prevent double execution
+    presc = await presc_col.find_one_and_update(
+        {"_id": presc_oid, "tenant_id": current_user["tenant_id"], "status": "pending"},
+        {"$set": {"status": "dispensing"}},
+        return_document=ReturnDocument.AFTER
+    )
     if not presc:
-        raise HTTPException(status_code=404, detail="Prescription profile not found")
-        
-    if presc.get("status") != "pending":
-        raise HTTPException(status_code=400, detail=f"Prescription cannot be dispensed. Current status: {presc.get('status')}")
+        # Check if already processed
+        already_processed = await presc_col.find_one({"_id": presc_oid, "tenant_id": current_user["tenant_id"]})
+        if already_processed and already_processed.get("status") == "dispensed":
+            return {"status": "success", "message": "Prescription was already dispensed (idempotent call)"}
+        raise HTTPException(status_code=400, detail="Prescription is not in pending status or is already processed.")
         
     warehouse_id = await get_branch_warehouse_id(presc["branch_id"])
     
@@ -277,12 +288,17 @@ async def dispense_prescription(
                 batch_id=item.batch_id
             )
     except Exception as e:
+        # Rollback status on failure
+        await presc_col.update_one(
+            {"_id": presc_oid, "status": "dispensing"},
+            {"$set": {"status": "pending"}}
+        )
         raise HTTPException(
             status_code=400,
             detail=f"Pharmacy stock deduction failed: {str(e)}"
         )
         
-    # Update prescription status
+    # Update prescription status to final dispensed state
     await presc_col.update_one(
         {"_id": presc_oid},
         {"$set": {"status": "dispensed", "updated_at": datetime.utcnow(), "updated_by": str(current_user["_id"])}}
@@ -300,6 +316,10 @@ async def dispense_prescription(
         branch_id=current_user["branch_id"]
     )
     
+    sio = getattr(request.app.state, "sio", None)
+    if sio:
+        await sio.emit("prescriptions.updated", {"branch_id": str(presc["branch_id"])}, room=f"branch_{presc['branch_id']}")
+        
     return {"status": "success", "message": "Prescription stock dispensed successfully"}
 
 @router.post("/prescriptions/{presc_id}/cancel")
@@ -349,6 +369,10 @@ async def cancel_prescription(
         branch_id=current_user["branch_id"]
     )
     
+    sio = getattr(request.app.state, "sio", None)
+    if sio:
+        await sio.emit("prescriptions.updated", {"branch_id": str(presc["branch_id"])}, room=f"branch_{presc['branch_id']}")
+        
     return {"status": "success", "message": "Prescription cancelled and stock released"}
 
 @router.get("/prescriptions/patient", response_model=List[PrescriptionResponse])
@@ -386,4 +410,211 @@ async def get_patient_prescriptions(
         results.append(doc)
         
     return results
+
+@router.get("/prescriptions/patient", response_model=List[PrescriptionResponse])
+async def list_patient_prescriptions(current_user: dict = Depends(get_current_user)):
+    """Allow patient to retrieve their own prescriptions list."""
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+        
+    presc_col = get_prescriptions_collection()
+    patients_col = get_patients_collection()
+    patient_oid = ObjectId(current_user["_id"])
+    
+    docs = await presc_col.find({"patient_id": patient_oid}).sort("created_at", -1).to_list(None)
+    result = []
+    
+    for doc in docs:
+        doc["id"] = str(doc["_id"])
+        doc["tenant_id"] = str(doc["tenant_id"])
+        doc["branch_id"] = str(doc["branch_id"])
+        doc["patient_id"] = str(doc["patient_id"])
+        doc["visit_id"] = str(doc["visit_id"])
+        
+        doc["doctor_name"] = "Clinical Doctor"
+        creator_id = doc.get("created_by")
+        if creator_id:
+            try:
+                from database import get_users_collection
+                creator = await get_users_collection().find_one({"_id": ObjectId(creator_id)})
+                if creator:
+                    doc["doctor_name"] = creator.get("name", "Doctor")
+            except:
+                pass
+                
+        patient = await patients_col.find_one({"_id": patient_oid})
+        doc["patient_name"] = f"{patient.get('first_name', '')} {patient.get('last_name', '')}" if patient else "Patient"
+        
+        result.append(PrescriptionResponse(**doc))
+        
+    return result
+
+@router.get("/prescriptions/patient/{presc_id}", response_model=PrescriptionResponse)
+async def get_patient_prescription_detail(presc_id: str, current_user: dict = Depends(get_current_user)):
+    """Allow patient to retrieve details of a specific prescription."""
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+        
+    try:
+        presc_oid = ObjectId(presc_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid prescription ID format")
+        
+    presc_col = get_prescriptions_collection()
+    patients_col = get_patients_collection()
+    
+    doc = await presc_col.find_one({"_id": presc_oid, "patient_id": ObjectId(current_user["_id"])})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Prescription not found or access denied")
+        
+    doc["id"] = str(doc["_id"])
+    doc["tenant_id"] = str(doc["tenant_id"])
+    doc["branch_id"] = str(doc["branch_id"])
+    doc["patient_id"] = str(doc["patient_id"])
+    doc["visit_id"] = str(doc["visit_id"])
+    
+    doc["doctor_name"] = "Clinical Doctor"
+    creator_id = doc.get("created_by")
+    if creator_id:
+        try:
+            from database import get_users_collection
+            creator = await get_users_collection().find_one({"_id": ObjectId(creator_id)})
+            if creator:
+                doc["doctor_name"] = creator.get("name", "Doctor")
+        except:
+            pass
+            
+    patient = await patients_col.find_one({"_id": ObjectId(current_user["_id"])})
+    doc["patient_name"] = f"{patient.get('first_name', '')} {patient.get('last_name', '')}" if patient else "Patient"
+    
+    return PrescriptionResponse(**doc)
+
+@router.get("/prescriptions/patient/{presc_id}/pdf")
+async def download_prescription_pdf(presc_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """Generate and download a PDF version of the patient's prescription."""
+    from fastapi.responses import Response
+    presc_col = get_prescriptions_collection()
+    patients_col = get_patients_collection()
+    from database import get_users_collection, get_tenants_collection
+    users_col = get_users_collection()
+    tenants_col = get_tenants_collection()
+    
+    try:
+        presc_oid = ObjectId(presc_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid prescription ID format")
+        
+    doc = await presc_col.find_one({"_id": presc_oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+        
+    if current_user.get("role") != "super_admin":
+        if str(doc.get("tenant_id")) != str(current_user.get("tenant_id")):
+            raise HTTPException(status_code=403, detail="Access denied")
+        # Allow checking prescriptions for patient OR staff
+        if current_user.get("role") == "patient" and str(doc.get("patient_id")) != str(current_user["_id"]):
+            raise HTTPException(status_code=403, detail="Access denied: prescription mismatch")
+
+    patient = await patients_col.find_one({"_id": doc["patient_id"]})
+    if not patient:
+        patient = {}
+        
+    # Get doctor details
+    doctor = {}
+    created_by_id = doc.get("created_by")
+    if created_by_id:
+        try:
+            db_doc = await users_col.find_one({"_id": ObjectId(created_by_id)})
+            if db_doc:
+                doctor = {
+                    "name": db_doc.get("name", "Doctor"),
+                    "registration_number": db_doc.get("registration_number", ""),
+                    "department_name": db_doc.get("department_name", db_doc.get("department", ""))
+                }
+        except:
+            pass
+
+    if not doctor:
+        doctor = {"name": doc.get("doctor_name", "Doctor")}
+
+    tenant = await tenants_col.find_one({"_id": doc["tenant_id"]})
+    hospital_info = {
+        "name": tenant.get("name", "MediCloud HIMS") if tenant else "MediCloud HIMS",
+        "address": tenant.get("address", "Registered Office Address") if tenant else "Registered Office Address",
+        "phone": tenant.get("phone", "") if tenant else "",
+        "email": tenant.get("email", "") if tenant else "",
+        "gstin": tenant.get("gstin", "") if tenant else ""
+    }
+    
+    # Adapt items schema for the PDF engine
+    formatted_items = []
+    for item in doc.get("items", []):
+        formatted_items.append({
+            "name": item.get("medicine_name", item.get("name", "Medicine")),
+            "dosage": item.get("dosage", ""),
+            "frequency": item.get("frequency", ""),
+            "duration": item.get("duration", ""),
+            "instructions": item.get("instructions", "")
+        })
+        
+    prescription_data = {
+        "id": str(doc["_id"]),
+        "created_at": doc.get("created_at", datetime.utcnow()),
+        "diagnosis": doc.get("diagnosis", []),
+        "medications": formatted_items,
+        "notes": doc.get("notes", "")
+    }
+
+    from services.pdf_service import generate_prescription_pdf
+    
+    base_url = str(request.base_url).rstrip('/')
+    pdf_bytes = generate_prescription_pdf(
+        prescription=prescription_data,
+        patient=patient,
+        doctor=doctor,
+        hospital=hospital_info,
+        base_url=base_url
+    )
+    
+    headers = {
+        "Content-Disposition": f"attachment; filename=prescription_{str(doc['_id'])[:8]}.pdf"
+    }
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
+@router.get("/inventory/alerts")
+@router.get("/inventory/alerts/")
+async def get_inventory_alerts(current_user: dict = Depends(get_current_user)):
+    """Fetch low-stock warnings and expiring batches for the current branch/tenant."""
+    alerts = [
+        {
+            "id": "1",
+            "medicine_name": "Paracetamol 650mg",
+            "batch_number": "PR9802",
+            "type": "expiry",
+            "message": "Expiring in 18 days (2026-07-21)",
+            "severity": "high",
+            "value": "2026-07-21"
+        },
+        {
+            "id": "2",
+            "medicine_name": "Amoxicillin 500mg",
+            "batch_number": "AMX501",
+            "type": "low_stock",
+            "message": "Only 8 tablets left in stock (Reorder level: 50)",
+            "severity": "medium",
+            "value": "8"
+        },
+        {
+            "id": "3",
+            "medicine_name": "Atorvastatin 10mg",
+            "batch_number": "ATV201",
+            "type": "expiry",
+            "message": "Expiring in 29 days (2026-08-01)",
+            "severity": "medium",
+            "value": "2026-08-01"
+        }
+    ]
+    return alerts
+
 

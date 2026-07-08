@@ -592,3 +592,47 @@ async def update_ambulance_booking(
         branch_id=current_user["branch_id"]
     )
     return AmbulanceBookingResponse(**updated)
+
+
+class AmbulanceLocationUpdate(BaseModel):
+    driver_id: str
+    latitude: float
+    longitude: float
+    timestamp: str
+
+@router.post("/ambulance/location")
+async def update_ambulance_location(
+    payload: AmbulanceLocationUpdate,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Receive live telemetry coordinates from active ambulance drivers and broadcast to admin control rooms via Socket.IO."""
+    col = get_ambulance_bookings_collection()
+    
+    await col.update_many(
+        {
+            "driver_name": current_user["name"],
+            "status": {"$in": ["dispatched", "arrived", "en_route_hospital"]},
+            "tenant_id": current_user["tenant_id"]
+        },
+        {
+            "$set": {
+                "last_latitude": payload.latitude,
+                "last_longitude": payload.longitude,
+                "last_location_time": datetime.utcnow()
+            }
+        }
+    )
+    
+    sio = getattr(request.app.state, "sio", None)
+    if sio:
+        await sio.emit("ambulance.location_stream", {
+            "driver_id": payload.driver_id,
+            "driver_name": current_user["name"],
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+            "timestamp": payload.timestamp
+        }, room=f"branch_{current_user['branch_id']}")
+        
+    return {"status": "success", "message": "Telemetry coordinate broadcast logged."}
+

@@ -71,12 +71,9 @@ async def visit_summarize(payload: VisitSummarizeRequest, request: Request, curr
     try:
         generated_text = await call_gemini_api(prompt)
     except Exception as e:
-        print(f"Gemini API invocation failed, using local mock fallback: {e}")
-        # Rule-based fallback summary text
-        generated_text = (
-            f"Clinical Summary: Patient presented with {payload.symptoms}. "
-            f"Notes describe: {payload.clinical_notes}. "
-            f"Diagnosed with: {', '.join(payload.diagnosis)}."
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"AI Summarization Service failed: {str(e)}"
         )
         
     doc = {
@@ -140,12 +137,9 @@ async def simplify_instructions(payload: SimplifyInstructionsRequest, request: R
     try:
         generated_text = await call_gemini_api(prompt)
     except Exception as e:
-        print(f"Gemini API invocation failed, using local mock fallback: {e}")
-        # Rule-based fallback instructions text
-        generated_text = (
-            f"Simplified instructions ({payload.target_language}): "
-            f"Please make sure to follow: {payload.instructions}. "
-            f"Take care of your health."
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"AI Simplify Instructions Service failed: {str(e)}"
         )
         
     doc = {

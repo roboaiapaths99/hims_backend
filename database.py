@@ -23,6 +23,7 @@ async def connect_to_mongo():
         print("Connected to MongoDB for HMIS")
         await create_indexes()
         await seed_saas_plans()
+        await seed_drug_directory()
         return True
     except Exception as e:
         print(f"Error connecting to MongoDB: {e}")
@@ -201,6 +202,21 @@ def get_saas_plans_collection():
 def get_saas_payments_collection():
     return get_db().saas_payments
 
+def get_doctor_schedules_collection():
+    return get_db().doctor_schedules
+
+def get_doctor_leaves_collection():
+    return get_db().doctor_leaves
+
+def get_drug_directory_collection():
+    return get_db().drug_directory
+
+def get_prescription_templates_collection():
+    return get_db().prescription_templates
+
+def get_investigation_packages_collection():
+    return get_db().investigation_packages
+
 async def seed_saas_plans():
     try:
         col = get_saas_plans_collection()
@@ -288,6 +304,7 @@ async def create_indexes():
         # Users index (Scoped by email)
         await db.users.create_index("email", unique=True)
         await db.users.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING)])
+        await db.users.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING), ("role", ASCENDING)])
         
         # Patients index (Scoped by tenant and branch)
         await db.patients.create_index("phone")
@@ -304,14 +321,34 @@ async def create_indexes():
         
         # Audit Logs
         await db.audit_logs.create_index([("tenant_id", ASCENDING), ("timestamp", DESCENDING)])
+        await db.audit_logs.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING), ("created_at", DESCENDING)])
+        await db.audit_logs.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
+        
+        # Rooms index
+        await db.rooms.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING), ("room_number", ASCENDING)])
+        
+        # Vitals Indexes
+        await db.vitals.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING), ("patient_id", ASCENDING), ("created_at", DESCENDING)])
+        await db.vitals.create_index([("admission_id", ASCENDING), ("created_at", DESCENDING)])
         
         # IPD Admissions Indexes
         await db.ipd_admissions.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING)])
+        await db.ipd_admissions.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING), ("status", ASCENDING)])
+        await db.ipd_admissions.create_index([("tenant_id", ASCENDING), ("patient_id", ASCENDING)])
         await db.ipd_admissions.create_index("patient_id")
         await db.ipd_admissions.create_index("status")
+        await db.ipd_admissions.create_index([("room_id", ASCENDING), ("bed_id", ASCENDING), ("status", ASCENDING)])
         
         # IPD Charges Indexes
         await db.ipd_charges.create_index("admission_id")
+        
+        # Lab Orders Indexes
+        await db.lab_orders.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING), ("status", ASCENDING)])
+        await db.lab_orders.create_index([("patient_id", ASCENDING), ("created_at", DESCENDING)])
+        
+        # Prescriptions Indexes
+        await db.prescriptions.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING), ("status", ASCENDING)])
+        await db.prescriptions.create_index([("patient_id", ASCENDING), ("created_at", DESCENDING)])
         
         # TPA Module Indexes
         await db.patient_policies.create_index("patient_id")
@@ -335,6 +372,8 @@ async def create_indexes():
         await db.emergency_admissions.create_index("triage_category")
         await db.emergency_admissions.create_index("status")
         await db.ambulance_bookings.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING)])
+        await db.ambulance_bookings.create_index([("tenant_id", ASCENDING), ("branch_id", ASCENDING), ("status", ASCENDING)])
+        await db.ambulance_bookings.create_index([("driver_id", ASCENDING), ("status", ASCENDING)])
         await db.ambulance_bookings.create_index("status")
         
         # Visitor & Diet Module Indexes
@@ -425,5 +464,28 @@ def get_dms_webhook_events_collection():
 
 def get_dms_similar_case_searches_collection():
     return get_db().dms_similar_case_searches
+
+async def seed_drug_directory():
+    try:
+        col = get_drug_directory_collection()
+        count = await col.count_documents({})
+        if count == 0:
+            default_drugs = [
+                {"name": "Paracetamol 650", "generic_name": "Paracetamol", "strength": "650mg", "form": "Tablet", "manufacturer": "Micro Labs"},
+                {"name": "Amoxicillin 500", "generic_name": "Amoxicillin", "strength": "500mg", "form": "Capsule", "manufacturer": "Cipla"},
+                {"name": "Metformin 500", "generic_name": "Metformin Hydrochloride", "strength": "500mg", "form": "Tablet", "manufacturer": "Abbott"},
+                {"name": "Pantocid 40", "generic_name": "Pantoprazole", "strength": "40mg", "form": "Tablet", "manufacturer": "Sun Pharma"},
+                {"name": "Cetirizine 10", "generic_name": "Cetirizine Hydrochloride", "strength": "10mg", "form": "Tablet", "manufacturer": "Alkem"},
+                {"name": "Amlong 5", "generic_name": "Amlodipine Besylate", "strength": "5mg", "form": "Tablet", "manufacturer": "Micro Labs"},
+                {"name": "Azithral 500", "generic_name": "Azithromycin", "strength": "500mg", "form": "Tablet", "manufacturer": "Alembic"},
+                {"name": "Combiflam", "generic_name": "Ibuprofen + Paracetamol", "strength": "400mg + 325mg", "form": "Tablet", "manufacturer": "Sanofi"},
+                {"name": "Becosules", "generic_name": "Vitamin B-Complex", "strength": "Standard", "form": "Capsule", "manufacturer": "Pfizer"},
+                {"name": "Omee 20", "generic_name": "Omeprazole", "strength": "20mg", "form": "Capsule", "manufacturer": "Alkem"}
+            ]
+            await col.insert_many(default_drugs)
+            print("Seeded common drug master catalog database")
+    except Exception as e:
+        print(f"Error seeding drug directory: {e}")
+
 
 

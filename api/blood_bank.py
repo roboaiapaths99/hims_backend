@@ -48,14 +48,23 @@ def check_compatibility(donor_group: str, recipient_group: str) -> bool:
         return recipient_group in ["AB-", "AB+"]
     return False
 
+def get_request_branch_id(request: Request, current_user: dict) -> ObjectId:
+    branch_id_str = request.headers.get("x-branch-id") or request.headers.get("X-Branch-ID") or current_user.get("branch_id")
+    if not branch_id_str:
+        raise HTTPException(status_code=400, detail="Branch scope context missing. Please select a branch first.")
+    try:
+        return ObjectId(str(branch_id_str))
+    except:
+        raise HTTPException(status_code=400, detail="Invalid branch ID format")
+
 # ------------------------------------------------------------------
 # STOCK ENDPOINTS
 # ------------------------------------------------------------------
 @router.get("/stock")
-async def get_blood_stock(current_user: dict = Depends(get_current_user)):
+async def get_blood_stock(request: Request, current_user: dict = Depends(get_current_user)):
     stock_col = get_blood_stock_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     # Get available stock detailed list
     cursor = stock_col.find({
@@ -87,10 +96,10 @@ async def get_blood_stock(current_user: dict = Depends(get_current_user)):
     }
 
 @router.post("/stock/adjust")
-async def adjust_blood_stock(payload: dict, current_user: dict = Depends(get_current_user)):
+async def adjust_blood_stock(payload: dict, request: Request, current_user: dict = Depends(get_current_user)):
     stock_col = get_blood_stock_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     bag_number = payload.get("bag_number")
     action = payload.get("action")  # discard
@@ -124,10 +133,10 @@ async def adjust_blood_stock(payload: dict, current_user: dict = Depends(get_cur
 # DONORS ENDPOINTS
 # ------------------------------------------------------------------
 @router.get("/donors", response_model=List[BloodDonorResponse])
-async def list_donors(current_user: dict = Depends(get_current_user)):
+async def list_donors(request: Request, current_user: dict = Depends(get_current_user)):
     donors_col = get_blood_donors_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     cursor = donors_col.find({"tenant_id": tenant_id, "branch_id": branch_id})
     donors = await cursor.to_list(None)
@@ -141,10 +150,10 @@ async def list_donors(current_user: dict = Depends(get_current_user)):
     return res
 
 @router.post("/donors", response_model=BloodDonorResponse)
-async def register_donor(payload: BloodDonorCreate, current_user: dict = Depends(get_current_user)):
+async def register_donor(payload: BloodDonorCreate, request: Request, current_user: dict = Depends(get_current_user)):
     donors_col = get_blood_donors_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     # Generate donor number dynamically
     count = await donors_col.count_documents({"tenant_id": tenant_id})
@@ -189,12 +198,12 @@ async def record_donor_screening(id: str, payload: DonorScreeningBase, current_u
     return {"status": "success", "message": "Donor screening vitals recorded successfully."}
 
 @router.post("/donors/{id}/donate")
-async def collect_donation(id: str, payload: BloodDonationCreate, current_user: dict = Depends(get_current_user)):
+async def collect_donation(id: str, payload: BloodDonationCreate, request: Request, current_user: dict = Depends(get_current_user)):
     donors_col = get_blood_donors_collection()
     donations_col = get_blood_donations_collection()
     stock_col = get_blood_stock_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid donor ID format")
@@ -249,11 +258,11 @@ async def collect_donation(id: str, payload: BloodDonationCreate, current_user: 
     }
 
 @router.post("/donations/{bag_number}/testing")
-async def log_testing_outcome(bag_number: str, payload: LabTestingUpdate, current_user: dict = Depends(get_current_user)):
+async def log_testing_outcome(bag_number: str, payload: LabTestingUpdate, request: Request, current_user: dict = Depends(get_current_user)):
     donations_col = get_blood_donations_collection()
     stock_col = get_blood_stock_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     donation = await donations_col.find_one({"bag_number": bag_number, "tenant_id": tenant_id})
     if not donation:
@@ -303,10 +312,10 @@ async def log_testing_outcome(bag_number: str, payload: LabTestingUpdate, curren
 # REQUISITIONS & TRANSFUSION ENDPOINTS
 # ------------------------------------------------------------------
 @router.get("/requisitions", response_model=List[BloodRequisitionResponse])
-async def list_requisitions(current_user: dict = Depends(get_current_user)):
+async def list_requisitions(request: Request, current_user: dict = Depends(get_current_user)):
     req_col = get_blood_requisitions_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     cursor = req_col.find({"tenant_id": tenant_id, "branch_id": branch_id})
     reqs = await cursor.to_list(None)
@@ -321,11 +330,11 @@ async def list_requisitions(current_user: dict = Depends(get_current_user)):
     return res
 
 @router.post("/requisitions", response_model=BloodRequisitionResponse)
-async def create_requisition(payload: BloodRequisitionCreate, current_user: dict = Depends(get_current_user)):
+async def create_requisition(payload: BloodRequisitionCreate, request: Request, current_user: dict = Depends(get_current_user)):
     req_col = get_blood_requisitions_collection()
     pat_col = get_patients_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     if not ObjectId.is_valid(payload.patient_id):
         raise HTTPException(status_code=400, detail="Invalid Patient ID format")
@@ -402,12 +411,12 @@ async def crossmatch_requisition(id: str, payload: BloodCrossmatchCreate, curren
     return {"status": "success", "message": f"Bag {payload.bag_number} crossmatched and allocated for request {req['request_number']}."}
 
 @router.post("/requisitions/{id}/transfuse")
-async def record_transfusion(id: str, payload: BloodTransfusionCreate, current_user: dict = Depends(get_current_user)):
+async def record_transfusion(id: str, payload: BloodTransfusionCreate, request: Request, current_user: dict = Depends(get_current_user)):
     req_col = get_blood_requisitions_collection()
     stock_col = get_blood_stock_collection()
     trans_col = get_blood_transfusions_collection()
     tenant_id = current_user.get("tenant_id")
-    branch_id = current_user.get("branch_id")
+    branch_id = get_request_branch_id(request, current_user)
     
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid Requisition ID format")

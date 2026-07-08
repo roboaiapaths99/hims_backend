@@ -104,6 +104,35 @@ async def create_lab_order(payload: LabOrderCreate, request: Request, current_us
     doc["patient_name"] = f"{patient.get('first_name', '')} {patient.get('last_name', '')}"
     doc["doctor_name"] = current_user.get("name", "Doctor")
     
+    # Auto-post lab charges to billing
+    try:
+        from services.auto_charge_service import post_auto_charges
+        billing_items = [
+            {
+                "description": f"Lab Test: {item.test_name} ({item.test_code})",
+                "quantity": 1,
+                "base_price": item.price,
+                "gst_rate": 0.0
+            }
+            for item in payload.items if item.price > 0
+        ]
+        await post_auto_charges(
+            tenant_id=current_user["tenant_id"],
+            branch_id=current_user["branch_id"],
+            patient_id=payload.patient_id,
+            visit_id=payload.visit_id,
+            line_items=billing_items,
+            source="lab",
+            source_order_id=doc["id"],
+            created_by=str(current_user["_id"]),
+            created_by_name=current_user.get("name", "System")
+        )
+    except Exception as e:
+        # Non-blocking: log error but don't fail the lab order
+        import traceback
+        traceback.print_exc()
+        print(f"[AUTO-CHARGE] Lab charge capture failed: {e}")
+    
     await create_audit_log(
         user_id=str(current_user["_id"]),
         user_name=current_user["name"],
@@ -445,28 +474,6 @@ async def get_lab_order_results(order_id: str, current_user: dict = Depends(get_
     doc["lab_order_id"] = str(doc["lab_order_id"])
     return LabResultResponse(**doc)
 
-@router.get("/results/patient", response_model=List[LabOrderResponse])
-async def get_patient_lab_results(
-    current_user: dict = Depends(get_current_user)
-):
-    orders_col = get_lab_orders_collection()
-    patient_id = current_user["_id"]
-    
-    query = {
-        "patient_id": patient_id,
-        "tenant_id": ObjectId(str(current_user["tenant_id"]))
-    }
-    
-    docs = await orders_col.find(query).sort("created_at", -1).to_list(None)
-    results = []
-    for doc in docs:
-        doc["id"] = str(doc["_id"])
-        doc["tenant_id"] = str(doc["tenant_id"])
-        doc["branch_id"] = str(doc["branch_id"])
-        doc["patient_id"] = str(doc["patient_id"])
-        doc["visit_id"] = str(doc["visit_id"]) if doc.get("visit_id") else None
-        results.append(doc)
-    return results
 
 @router.get("/results", response_model=List[LabResultResponse])
 async def get_lab_results_by_visit(
@@ -493,4 +500,174 @@ async def get_lab_results_by_visit(
         response.append(r)
         
     return response
+
+@router.get("/results/patient", response_model=List[LabOrderResponse])
+async def list_patient_lab_results(current_user: dict = Depends(get_current_user)):
+    """Allow patient to retrieve their own lab orders list."""
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+        
+    orders_col = get_lab_orders_collection()
+    patients_col = get_patients_collection()
+    patient_oid = ObjectId(current_user["_id"])
+    
+    docs = await orders_col.find({"patient_id": patient_oid}).sort("created_at", -1).to_list(None)
+    result = []
+    
+    for doc in docs:
+        doc["id"] = str(doc["_id"])
+        doc["tenant_id"] = str(doc["tenant_id"])
+        doc["branch_id"] = str(doc["branch_id"])
+        doc["patient_id"] = str(doc["patient_id"])
+        doc["visit_id"] = str(doc["visit_id"])
+        
+        doc["doctor_name"] = "Clinical Doctor"
+        creator_id = doc.get("created_by")
+        if creator_id:
+            try:
+                from database import get_users_collection
+                creator = await get_users_collection().find_one({"_id": ObjectId(creator_id)})
+                if creator:
+                    doc["doctor_name"] = creator.get("name", "Doctor")
+            except:
+                pass
+                
+        patient = await patients_col.find_one({"_id": patient_oid})
+        doc["patient_name"] = f"{patient.get('first_name', '')} {patient.get('last_name', '')}" if patient else "Patient"
+        
+        result.append(LabOrderResponse(**doc))
+        
+    return result
+
+@router.get("/results/patient/{order_id}", response_model=LabOrderResponse)
+async def get_patient_lab_result_detail(order_id: str, current_user: dict = Depends(get_current_user)):
+    """Allow patient to retrieve details of a specific lab order/result."""
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+        
+    try:
+        order_oid = ObjectId(order_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid order ID format")
+        
+    orders_col = get_lab_orders_collection()
+    patients_col = get_patients_collection()
+    
+    doc = await orders_col.find_one({"_id": order_oid, "patient_id": ObjectId(current_user["_id"])})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Lab order not found or access denied")
+        
+    doc["id"] = str(doc["_id"])
+    doc["tenant_id"] = str(doc["tenant_id"])
+    doc["branch_id"] = str(doc["branch_id"])
+    doc["patient_id"] = str(doc["patient_id"])
+    doc["visit_id"] = str(doc["visit_id"])
+    
+    doc["doctor_name"] = "Clinical Doctor"
+    creator_id = doc.get("created_by")
+    if creator_id:
+        try:
+            from database import get_users_collection
+            creator = await get_users_collection().find_one({"_id": ObjectId(creator_id)})
+            if creator:
+                doc["doctor_name"] = creator.get("name", "Doctor")
+        except:
+            pass
+            
+    patient = await patients_col.find_one({"_id": ObjectId(current_user["_id"])})
+    doc["patient_name"] = f"{patient.get('first_name', '')} {patient.get('last_name', '')}" if patient else "Patient"
+    
+    return LabOrderResponse(**doc)
+
+@router.get("/results/patient/{order_id}/pdf")
+async def download_lab_result_pdf(order_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """Generate and download a PDF version of the patient's lab results."""
+    from fastapi.responses import Response
+    orders_col = get_lab_orders_collection()
+    patients_col = get_patients_collection()
+    results_col = get_lab_results_collection()
+    from database import get_users_collection, get_tenants_collection
+    users_col = get_users_collection()
+    tenants_col = get_tenants_collection()
+    
+    try:
+        order_oid = ObjectId(order_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid order ID format")
+        
+    doc = await orders_col.find_one({"_id": order_oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Lab order not found")
+        
+    if current_user.get("role") != "super_admin":
+        if str(doc.get("tenant_id")) != str(current_user.get("tenant_id")):
+            raise HTTPException(status_code=403, detail="Access denied")
+        # Allow viewing for patient OR staff
+        if current_user.get("role") == "patient" and str(doc.get("patient_id")) != str(current_user["_id"]):
+            raise HTTPException(status_code=403, detail="Access denied: patient mismatch")
+            
+    patient = await patients_col.find_one({"_id": doc["patient_id"]})
+    if not patient:
+        patient = {}
+        
+    # Get referring doctor details
+    doctor_name = "Self Referral"
+    doctor_id = doc.get("created_by") or doc.get("doctor_id")
+    if doctor_id:
+        try:
+            db_doc = await users_col.find_one({"_id": ObjectId(doctor_id)})
+            if db_doc:
+                doctor_name = db_doc.get("name", "Doctor")
+        except:
+            pass
+
+    tenant = await tenants_col.find_one({"_id": doc["tenant_id"]})
+    hospital_info = {
+        "name": tenant.get("name", "MediCloud HIMS") if tenant else "MediCloud HIMS",
+        "address": tenant.get("address", "Registered Office Address") if tenant else "Registered Office Address",
+        "phone": tenant.get("phone", "") if tenant else "",
+        "email": tenant.get("email", "") if tenant else "",
+        "gstin": tenant.get("gstin", "") if tenant else ""
+    }
+    
+    # Query results
+    db_results = await results_col.find({"order_id": order_oid}).to_list(None)
+    results_list = []
+    
+    if db_results:
+        for r in db_results:
+            results_list.append({
+                "parameter": r.get("parameter", r.get("test_parameter", "Investigation")),
+                "value": r.get("value", "—"),
+                "unit": r.get("unit", ""),
+                "normal_range": r.get("normal_range", ""),
+                "is_abnormal": r.get("is_abnormal", False)
+            })
+    else:
+        # Fallback to items if no results entered
+        for item in doc.get("items", []):
+            results_list.append({
+                "parameter": item.get("test_name", "Test Parameter"),
+                "value": "Pending",
+                "unit": "",
+                "normal_range": "",
+                "is_abnormal": False
+            })
+            
+    from services.pdf_service import generate_lab_report_pdf
+    
+    base_url = str(request.base_url).rstrip('/')
+    pdf_bytes = generate_lab_report_pdf(
+        lab_order=doc,
+        results=results_list,
+        patient=patient,
+        hospital=hospital_info,
+        doctor_name=doctor_name,
+        base_url=base_url
+    )
+    
+    headers = {
+        "Content-Disposition": f"attachment; filename=lab_results_{str(doc['_id'])[:8]}.pdf"
+    }
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 

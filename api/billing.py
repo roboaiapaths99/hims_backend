@@ -11,7 +11,8 @@ from database import (
     get_visits_collection,
     get_branches_collection,
     get_lab_orders_collection,
-    get_pricing_items_collection
+    get_pricing_items_collection,
+    get_advance_payments_collection
 )
 from middleware.auth import (
     get_current_user,
@@ -62,6 +63,13 @@ async def create_invoice(
 ):
     invoices_col = get_invoices_collection()
     patients_col = get_patients_collection()
+    
+    # Enforce role permission checks for invoice creation
+    if current_user.get("role") not in ["super_admin", "hospital_admin", "branch_admin", "receptionist", "billing_staff"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Unauthorized. Only billing staff, receptionists, or administrators can create billing invoices."
+        )
     
     # Verify patient profile
     try:
@@ -158,6 +166,10 @@ async def create_invoice(
         branch_id=current_user["branch_id"]
     )
     
+    sio = getattr(request.app.state, "sio", None)
+    if sio:
+        await sio.emit("billing.updated", {"branch_id": str(doc["branch_id"])}, room=f"branch_{doc['branch_id']}")
+        
     return InvoiceResponse(**doc)
 
 @router.get("/invoices", response_model=List[InvoiceResponse])
@@ -351,6 +363,30 @@ async def compile_draft_charges(payload: dict, current_user: dict = Depends(get_
                 "gst_rate": charge.get("gst_rate", 0.0),
                 "discount_percentage": 0.0
             })
+            
+        # Fetch all delivered dietary kitchen orders and add to bill
+        try:
+            from database import get_diet_orders_collection
+            diet_orders_col = get_diet_orders_collection()
+            delivered_diets = await diet_orders_col.find({
+                "admission_id": ipd_admission["_id"],
+                "status": "delivered"
+            }).to_list(None)
+            
+            for diet in delivered_diets:
+                meal = diet.get("meal_type", "lunch")
+                diet_type = diet.get("diet_type", "regular")
+                price = diet.get("price", 150.0)
+                draft_items.append({
+                    "description": f"IPD Dietary Catering: {meal.upper()} ({diet_type.replace('_', ' ').title()} Diet)",
+                    "quantity": 1,
+                    "base_price": price,
+                    "gst_rate": 5.0,  # 5% GST for catering/food services
+                    "discount_percentage": 0.0
+                })
+        except Exception as diet_err:
+            print(f"Error fetching diet charges for admission: {diet_err}")
+            
             
     return {
         "patient_id": str(patient_oid),
@@ -578,6 +614,10 @@ async def log_payment(
         branch_id=current_user["branch_id"]
     )
     
+    sio = getattr(request.app.state, "sio", None)
+    if sio:
+        await sio.emit("billing.updated", {"branch_id": str(doc["branch_id"])}, room=f"branch_{doc['branch_id']}")
+        
     return PaymentResponse(**doc)
 
 @router.get("/invoices/{id}/payments", response_model=List[PaymentResponse])
@@ -603,9 +643,12 @@ async def get_invoice_payments(id: str, current_user: dict = Depends(get_current
 from fastapi.responses import Response
 
 @router.get("/invoices/{id}/pdf")
-async def download_invoice_pdf(id: str, current_user: dict = Depends(get_current_user)):
+async def download_invoice_pdf(id: str, request: Request, current_user: dict = Depends(get_current_user)):
     invoices_col = get_invoices_collection()
     patients_col = get_patients_collection()
+    payments_col = get_payments_collection()
+    from database import get_tenants_collection
+    tenants_col = get_tenants_collection()
     
     try:
         invoice_oid = ObjectId(id)
@@ -617,63 +660,49 @@ async def download_invoice_pdf(id: str, current_user: dict = Depends(get_current
         raise HTTPException(status_code=404, detail="Invoice not found")
         
     patient = await patients_col.find_one({"_id": invoice["patient_id"]})
-    patient_name = f"{patient.get('first_name', '')} {patient.get('last_name', '')}".strip() if patient else "Unknown Patient"
+    if not patient:
+        patient = {}
+        
+    tenant = await tenants_col.find_one({"_id": current_user["tenant_id"]})
+    hospital_info = {
+        "name": tenant.get("name", "MediCloud HIMS") if tenant else "MediCloud HIMS",
+        "address": tenant.get("address", "Registered Office Address") if tenant else "Registered Office Address",
+        "phone": tenant.get("phone", "") if tenant else "",
+        "email": tenant.get("email", "") if tenant else "",
+        "gstin": tenant.get("gstin", "") if tenant else ""
+    }
     
-    invoice_num = invoice.get("invoice_number", "N/A")
-    grand_total = invoice.get("grand_total", 0.0)
-    status = invoice.get("payment_status", "due").upper()
+    items = invoice.get("items", [])
     
-    # Construct a valid minimal PDF 1.4 byte stream
-    pdf_template = f"""%PDF-1.4
-1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
-endobj
-2 0 obj
-<< /Type /Pages /Kids [3 0 R] /Count 1 >>
-endobj
-3 0 obj
-<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 595 842] /Contents 5 0 R >>
-endobj
-4 0 obj
-<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
-endobj
-5 0 obj
-<< /Length 200 >>
-stream
-BT
-/F1 20 Tf
-50 750 Td
-(HOSPITAL RECEIPT) Tj
-/F1 12 Tf
-0 -40 Td
-(Invoice Number: {invoice_num}) Tj
-0 -20 Td
-(Patient Name: {patient_name}) Tj
-0 -20 Td
-(Grand Total: INR {grand_total}) Tj
-0 -20 Td
-(Payment Status: {status}) Tj
-ET
-endstream
-endobj
-xref
-0 6
-0000000000 65535 f 
-0000000009 00000 n 
-0000000056 00000 n 
-0000000111 00000 n 
-0000000244 00000 n 
-0000000319 00000 n 
-trailer
-<< /Size 6 /Root 1 0 R >>
-startxref
-490
-%%EOF"""
+    # Query invoice payments history
+    db_payments = await payments_col.find({"invoice_id": invoice_oid}).to_list(None)
+    payment_records = []
+    for p in db_payments:
+        payment_records.append({
+            "created_at": p.get("created_at"),
+            "payment_method": p.get("payment_method", "Cash"),
+            "transaction_id": p.get("transaction_id", "—"),
+            "amount": p.get("amount", 0.0)
+        })
+        
+    from services.pdf_service import generate_invoice_pdf
     
+    base_url = str(request.base_url).rstrip('/')
+    pdf_bytes = generate_invoice_pdf(
+        invoice=invoice,
+        patient=patient,
+        hospital=hospital_info,
+        items=items,
+        payments=payment_records,
+        base_url=base_url
+    )
+    
+    invoice_num = invoice.get("invoice_number", "INV_N_A")
     headers = {
         "Content-Disposition": f"attachment; filename=invoice_{invoice_num}.pdf"
     }
-    return Response(content=pdf_template, media_type="application/pdf", headers=headers)
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
 
 class AdvanceDepositRequest(BaseModel):
     patient_id: str
@@ -694,7 +723,6 @@ async def record_advance_payment(
     request: Request,
     current_user: dict = Depends(get_current_user)
 ):
-    from database import get_advance_payments_collection
     try:
         patient_oid = ObjectId(payload.patient_id)
     except:
@@ -756,6 +784,10 @@ async def record_advance_payment(
         branch_id=current_user["branch_id"]
     )
     
+    sio = getattr(request.app.state, "sio", None)
+    if sio:
+        await sio.emit("billing.updated", {"branch_id": str(adv_doc["branch_id"])}, room=f"branch_{adv_doc['branch_id']}")
+        
     return {"status": "success", "advance_balance": new_balance, "transaction": adv_doc}
 
 @router.post("/refunds")
@@ -764,7 +796,6 @@ async def issue_refund(
     request: Request,
     current_user: dict = Depends(get_current_user)
 ):
-    from database import get_advance_payments_collection
     try:
         patient_oid = ObjectId(payload.patient_id)
     except:
@@ -970,5 +1001,195 @@ async def get_patient_financial_ledger(
         "entries": formatted_entries,
         "net_due": round(running_balance, 2)
     }
+
+@router.get("/invoices/patient", response_model=List[InvoiceResponse])
+async def list_patient_invoices(current_user: dict = Depends(get_current_user)):
+    """Allow patient to retrieve their own invoices list."""
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+        
+    invoices_col = get_invoices_collection()
+    patients_col = get_patients_collection()
+    patient_oid = ObjectId(current_user["_id"])
+    
+    docs = await invoices_col.find({"patient_id": patient_oid}).sort("created_at", -1).to_list(None)
+    result = []
+    
+    for doc in docs:
+        doc["id"] = str(doc["_id"])
+        doc["tenant_id"] = str(doc["tenant_id"])
+        doc["branch_id"] = str(doc["branch_id"])
+        doc["patient_id"] = str(doc["patient_id"])
+        doc["visit_id"] = str(doc["visit_id"]) if doc.get("visit_id") else None
+        
+        # Resolve patient
+        patient = await patients_col.find_one({"_id": patient_oid})
+        doc["patient_name"] = f"{patient.get('first_name', '')} {patient.get('last_name', '')}" if patient else "Patient"
+        
+        result.append(InvoiceResponse(**doc))
+        
+    return result
+
+@router.get("/invoices/patient/{invoice_id}", response_model=InvoiceResponse)
+async def get_patient_invoice_detail(invoice_id: str, current_user: dict = Depends(get_current_user)):
+    """Allow patient to retrieve details of a specific invoice."""
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+        
+    try:
+        invoice_oid = ObjectId(invoice_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid invoice ID format")
+        
+    invoices_col = get_invoices_collection()
+    patients_col = get_patients_collection()
+    
+    doc = await invoices_col.find_one({"_id": invoice_oid, "patient_id": ObjectId(current_user["_id"])})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Invoice not found or access denied")
+        
+    doc["id"] = str(doc["_id"])
+    doc["tenant_id"] = str(doc["tenant_id"])
+    doc["branch_id"] = str(doc["branch_id"])
+    doc["patient_id"] = str(doc["patient_id"])
+    doc["visit_id"] = str(doc["visit_id"]) if doc.get("visit_id") else None
+    
+    patient = await patients_col.find_one({"_id": ObjectId(current_user["_id"])})
+    doc["patient_name"] = f"{patient.get('first_name', '')} {patient.get('last_name', '')}" if patient else "Patient"
+    
+    return InvoiceResponse(**doc)
+
+@router.get("/invoices/patient/{id}/pdf")
+async def download_patient_invoice_pdf(id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """Allow patient to securely download their own invoice PDF after validating ownership."""
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+        
+    try:
+        invoice_oid = ObjectId(id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid invoice ID format")
+        
+    invoices_col = get_invoices_collection()
+    # Scoping check: must belong to this patient
+    invoice = await invoices_col.find_one({"_id": invoice_oid, "patient_id": ObjectId(current_user["_id"])})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found or access denied")
+        
+    return await download_invoice_pdf(id=id, request=request, current_user=current_user)
+
+
+
+@router.get("/reports/gst")
+async def get_gst_tax_report(
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_user)
+):
+    """Retrieve a detailed GSTR-1 compliant ledger report showing taxable values, CGST, SGST, and IGST breakdowns."""
+    role = current_user.get("role")
+    if role not in ["super_admin", "hospital_admin", "branch_admin", "accountant"]:
+        raise HTTPException(status_code=403, detail="Access denied: administrative rights required")
+        
+    invoices_col = get_invoices_collection()
+    patients_col = get_patients_collection()
+    branches_col = get_branches_collection()
+    
+    tenant_oid = current_user["tenant_id"]
+    branch_oid = current_user["branch_id"]
+    
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Must be YYYY-MM-DD")
+        
+    # Query invoices in range
+    query = {
+        "tenant_id": tenant_oid,
+        "branch_id": branch_oid,
+        "created_at": {"$gte": start_dt, "$lte": end_dt},
+        "payment_status": {"$in": ["paid", "partially_paid"]}
+    }
+    
+    invoices = await invoices_col.find(query).to_list(None)
+    
+    # Get hospital/branch state to identify CGST/SGST vs IGST
+    branch = await branches_col.find_one({"_id": branch_oid})
+    branch_state = branch.get("state", "Maharashtra").strip().lower() if branch else "maharashtra"
+    
+    ledger = []
+    total_taxable = 0.0
+    total_cgst = 0.0
+    total_sgst = 0.0
+    total_igst = 0.0
+    total_collected = 0.0
+    
+    for inv in invoices:
+        patient_oid = inv.get("patient_id")
+        patient = await patients_col.find_one({"_id": patient_oid}) if patient_oid else None
+        
+        patient_name = f"{patient.get('first_name', '')} {patient.get('last_name', '')}".strip() if patient else "Walk-In Patient"
+        patient_state = patient.get("state", branch_state).strip().lower() if patient else branch_state
+        patient_gstin = patient.get("gstin", "") if patient else ""
+        
+        subtotal = float(inv.get("subtotal", 0.0))
+        discount = float(inv.get("discount", 0.0))
+        taxable_amt = max(0.0, subtotal - discount)
+        
+        # Calculate GST rate breakdown
+        # Loop over line items to sum up total tax
+        tax_total = 0.0
+        for item in inv.get("items", []):
+            tax_total += float(item.get("tax_amount", 0.0) or 0.0)
+            
+        cgst = 0.0
+        sgst = 0.0
+        igst = 0.0
+        
+        # Split GST based on location (same state -> CGST+SGST, different state -> IGST)
+        if patient_state == branch_state:
+            cgst = round(tax_total / 2.0, 2)
+            sgst = round(tax_total - cgst, 2)
+        else:
+            igst = round(tax_total, 2)
+            
+        grand_total = float(inv.get("grand_total", taxable_amt + tax_total))
+        
+        total_taxable += taxable_amt
+        total_cgst += cgst
+        total_sgst += sgst
+        total_igst += igst
+        total_collected += grand_total
+        
+        ledger.append({
+            "invoice_id": str(inv["_id"]),
+            "invoice_number": inv.get("invoice_number", "N/A"),
+            "date": inv.get("created_at").strftime("%Y-%m-%d") if isinstance(inv.get("created_at"), datetime) else str(inv.get("created_at")),
+            "patient_name": patient_name,
+            "patient_gstin": patient_gstin,
+            "taxable_value": taxable_amt,
+            "cgst": cgst,
+            "sgst": sgst,
+            "igst": igst,
+            "total_tax": tax_total,
+            "grand_total": grand_total
+        })
+        
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "branch_state": branch_state.upper(),
+        "summary": {
+            "total_taxable_value": round(total_taxable, 2),
+            "total_cgst": round(total_cgst, 2),
+            "total_sgst": round(total_sgst, 2),
+            "total_igst": round(total_igst, 2),
+            "total_tax_collected": round(total_cgst + total_sgst + total_igst, 2),
+            "total_invoice_value": round(total_collected, 2)
+        },
+        "records": ledger
+    }
+
 
 

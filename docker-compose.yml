@@ -65,6 +65,25 @@ services:
     networks:
       - hmis-network
 
+  # ─── Celery Background Worker ──────────────────────────────────────
+  hmis-celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hmis-celery-worker
+    restart: unless-stopped
+    command: celery -A celery_app worker --loglevel=info
+    environment:
+      MONGODB_URI: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-adminpassword}@mongodb:27017/hmis_db?authSource=admin
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - hmis-network
+
   # ─── HMIS Frontend Web (React + Nginx) ─────────────────────────────
   hmis-web:
     build:

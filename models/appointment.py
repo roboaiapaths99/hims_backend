@@ -13,6 +13,8 @@ class AppointmentBase(BaseModel):
     status: str = Field(default="scheduled", pattern="^(scheduled|checked_in|waiting|in_vitals|ready_for_doctor|in_consultation|completed|cancelled)$")
     reason: Optional[str] = None
     referred_by_doctor_id: Optional[str] = None
+    tenant_id: Optional[str] = None
+    branch_id: Optional[str] = None
 
 class AppointmentCreate(AppointmentBase):
     pass

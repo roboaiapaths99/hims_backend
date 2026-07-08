@@ -70,6 +70,32 @@ async def create_radiology_order(
     doc["patient_name"] = f"{patient.get('first_name', '')} {patient.get('last_name', '')}"
     doc["patient_mrn"] = patient.get("mrn", "")
     
+    # Auto-post radiology charges to billing
+    if payload.price and payload.price > 0:
+        try:
+            from services.auto_charge_service import post_auto_charges
+            billing_items = [{
+                "description": f"Radiology: {payload.test_name} ({doc['modality']})",
+                "quantity": 1,
+                "base_price": payload.price,
+                "gst_rate": 0.0
+            }]
+            await post_auto_charges(
+                tenant_id=current_user["tenant_id"],
+                branch_id=current_user["branch_id"],
+                patient_id=payload.patient_id,
+                visit_id=payload.visit_id,
+                line_items=billing_items,
+                source="radiology",
+                source_order_id=doc["id"],
+                created_by=str(current_user["_id"]),
+                created_by_name=current_user.get("name", "System")
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[AUTO-CHARGE] Radiology charge capture failed: {e}")
+    
     await create_audit_log(
         user_id=str(current_user["_id"]),
         user_name=current_user["name"],

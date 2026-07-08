@@ -47,13 +47,15 @@ async def get_user_notifications(
     current_user: dict = Depends(get_current_user)
 ):
     col = get_notifications_collection()
-    user_id = current_user["_id"]
-    tenant_id_val = current_user.get("tenant_id")
-    tenant_id = ObjectId(str(tenant_id_val)) if tenant_id_val else None
+    user_id_str = str(current_user["_id"])
+    try:
+        user_id_oid = ObjectId(user_id_str)
+        user_ids = [user_id_oid, user_id_str]
+    except Exception:
+        user_ids = [user_id_str]
     
     query = {
-        "user_id": user_id,
-        "tenant_id": tenant_id
+        "user_id": {"$in": user_ids}
     }
     
     docs = await col.find(query).sort("created_at", -1).limit(limit).to_list(None)
@@ -73,13 +75,15 @@ async def mark_notifications_as_read(
     current_user: dict = Depends(get_current_user)
 ):
     col = get_notifications_collection()
-    user_id = current_user["_id"]
-    tenant_id_val = current_user.get("tenant_id")
-    tenant_id = ObjectId(str(tenant_id_val)) if tenant_id_val else None
+    user_id_str = str(current_user["_id"])
+    try:
+        user_id_oid = ObjectId(user_id_str)
+        user_ids = [user_id_oid, user_id_str]
+    except Exception:
+        user_ids = [user_id_str]
     
     query = {
-        "user_id": user_id,
-        "tenant_id": tenant_id
+        "user_id": {"$in": user_ids}
     }
     
     if payload and payload.ids:
@@ -104,16 +108,33 @@ async def get_unread_notification_count(
     current_user: dict = Depends(get_current_user)
 ):
     col = get_notifications_collection()
-    user_id = current_user["_id"]
-    tenant_id_val = current_user.get("tenant_id")
-    tenant_id = ObjectId(str(tenant_id_val)) if tenant_id_val else None
+    user_id_str = str(current_user["_id"])
+    try:
+        user_id_oid = ObjectId(user_id_str)
+        user_ids = [user_id_oid, user_id_str]
+    except Exception:
+        user_ids = [user_id_str]
     
     query = {
-        "user_id": user_id,
-        "tenant_id": tenant_id,
+        "user_id": {"$in": user_ids},
         "is_read": False
     }
     
     count = await col.count_documents(query)
     return {"count": count}
+
+@router.get("/me", response_model=List[NotificationResponse])
+async def get_my_notifications(
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user)
+):
+    return await get_user_notifications(limit=limit, current_user=current_user)
+
+@router.post("/{id}/read")
+async def mark_single_notification_read(
+    id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    req = MarkReadRequest(ids=[id])
+    return await mark_notifications_as_read(payload=req, current_user=current_user)
 

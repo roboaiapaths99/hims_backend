@@ -7,6 +7,7 @@ class RadiologyOrderCreate(BaseModel):
     visit_id: Optional[str] = None
     modality: str  # XRAY, MRI, CT, US
     test_name: str
+    price: float = 0.0
 
 class RadiologyOrderResponse(BaseModel):
     id: str

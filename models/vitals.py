@@ -14,7 +14,8 @@ class VitalsBase(BaseModel):
     height: float = Field(..., ge=30.0, le=250.0) # Height (cm)
     weight: float = Field(..., ge=1.0, le=300.0) # Weight (kg)
     pain_score: int = Field(default=0, ge=0, le=10) # Pain scale 0-10
-    triage_level: str = Field(default="green", pattern="^(red|yellow|green)$")
+    triage_level: str = Field(default="green", pattern="^(red|orange|yellow|green)$")
+    news_score: Optional[int] = None
 
 class VitalsCreate(VitalsBase):
     pass

@@ -11,7 +11,8 @@ from database import (
     get_patients_collection, get_branches_collection, 
     get_db, get_audit_logs_collection, get_visits_collection,
     get_invoices_collection, get_lab_orders_collection,
-    get_radiology_orders_collection, get_users_collection
+    get_radiology_orders_collection, get_users_collection,
+    get_stored_files_collection
 )
 from middleware.auth import (
     require_permission, get_current_user, get_tenant_filter, 
@@ -24,6 +25,9 @@ from models.patient import (
     PatientDocumentCreate, PatientDocumentResponse,
     FamilyMemberCreate, FamilyMemberResponse
 )
+import uuid
+import shutil
+from api.storage import FORBIDDEN_EXTENSIONS, get_s3_client
 
 router = APIRouter()
 
@@ -333,12 +337,45 @@ async def get_patient_portal_data(current_user: dict = Depends(get_current_user)
             "results_url": ro.get("results_url")
         })
         
+    # 6. Check active IPD admission & diet orders
+    from database import get_ipd_admissions_collection, get_rooms_collection, get_diet_orders_collection
+    ipd_col = get_ipd_admissions_collection()
+    active_adm = await ipd_col.find_one({"patient_id": patient_oid, "status": "admitted"})
+    
+    formatted_admission = None
+    if active_adm:
+        rooms_col = get_rooms_collection()
+        room = await rooms_col.find_one({"_id": active_adm["room_id"]})
+        room_number = room.get("room_number", "Ward") if room else "Ward"
+        
+        diet_col = get_diet_orders_collection()
+        diet_orders = await diet_col.find({"admission_id": active_adm["_id"]}).sort("created_at", -1).to_list(None)
+        
+        formatted_diet_orders = []
+        for d in diet_orders:
+            formatted_diet_orders.append({
+                "id": str(d["_id"]),
+                "meal_type": d.get("meal_type"),
+                "diet_type": d.get("diet_type"),
+                "status": d.get("status"),
+                "special_instructions": d.get("special_instructions"),
+                "created_at": d.get("created_at").strftime("%Y-%m-%d %H:%M") if isinstance(d.get("created_at"), datetime) else str(d.get("created_at"))
+            })
+            
+        formatted_admission = {
+            "id": str(active_adm["_id"]),
+            "room_number": room_number,
+            "admission_date": active_adm["admission_date"].strftime("%Y-%m-%d") if isinstance(active_adm["admission_date"], datetime) else str(active_adm["admission_date"]),
+            "diet_orders": formatted_diet_orders
+        }
+        
     return {
         "profile": profile,
         "visits": formatted_visits,
         "invoices": formatted_invoices,
         "labs": formatted_labs,
-        "radiology": formatted_rad
+        "radiology": formatted_rad,
+        "admission": formatted_admission
     }
 
 @router.get("/{patient_id}", response_model=PatientResponse)
@@ -475,29 +512,71 @@ async def upload_patient_document(
         
     # Validate file size < 10MB
     max_size = 10 * 1024 * 1024
-    size = 0
     contents = await file.read()
     if len(contents) > max_size:
         raise HTTPException(status_code=400, detail="File exceeds maximum allowed size of 10MB")
     await file.seek(0)
     
-    # Local uploads directory mock fallback
-    upload_dir = os.path.join(os.getcwd(), "uploads", "patients", patient_id)
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, file.filename)
-    
-    async with aiofiles.open(file_path, 'wb') as out_file:
-        await out_file.write(contents)
+    # Validate extension
+    filename = file.filename or "unnamed_file"
+    ext = filename.split('.')[-1].lower() if '.' in filename else ''
+    if ext in FORBIDDEN_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Executable or script uploads are forbidden for security reasons."
+        )
         
-    # Simulating secure S3 URL mapping
-    relative_url = f"/uploads/patients/{patient_id}/{file.filename}"
+    # Save file physically with high-entropy unique prefix
+    os.makedirs("uploads", exist_ok=True)
+    unique_filename = f"{uuid.uuid4()}_{filename}"
+    file_path = os.path.join("uploads", unique_filename)
     
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(contents)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to write file to storage: {str(e)}"
+        )
+        
+    # S3 Upload
+    s3_client = get_s3_client()
+    if s3_client:
+        try:
+            s3_client.upload_file(file_path, settings.S3_BUCKET_NAME, unique_filename)
+            os.remove(file_path)
+        except Exception as e:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to upload file to S3: {str(e)}"
+            )
+            
+    # Insert metadata in stored_files DB
+    files_col = get_stored_files_collection()
+    file_doc = {
+        "tenant_id": current_user.get("tenant_id") or patient_oid,
+        "branch_id": current_user.get("branch_id"),
+        "filename": unique_filename,
+        "original_name": filename,
+        "mime_type": file.content_type or "application/octet-stream",
+        "size": len(contents),
+        "created_at": datetime.utcnow()
+    }
+    inject_audit_fields(current_user, file_doc)
+    res_file = await files_col.insert_one(file_doc)
+    file_id = str(res_file.inserted_id)
+    
+    # Map to patient_documents
     col = get_db().patient_documents
     doc_record = {
         "patient_id": patient_oid,
         "document_name": document_name,
         "document_type": document_type,
-        "file_url": relative_url,
+        "file_url": f"/api/storage/files/{file_id}/preview",
+        "file_id": res_file.inserted_id,
         "uploaded_at": datetime.utcnow()
     }
     
@@ -505,7 +584,7 @@ async def upload_patient_document(
     doc_record["id"] = str(res.inserted_id)
     doc_record["patient_id"] = patient_id
     
-    return PatientDocumentResponse(**doc_record)
+    return doc_record
 
 @router.get("/{patient_id}/documents", response_model=List[PatientDocumentResponse])
 async def list_patient_documents(patient_id: str, current_user: dict = Depends(get_current_user)):
@@ -561,9 +640,8 @@ async def add_patient_family_member(
 ):
     try:
         patient_oid = ObjectId(patient_id)
-        linked_oid = ObjectId(payload.linked_patient_id)
     except:
-        raise HTTPException(status_code=400, detail="Invalid ID formats")
+        raise HTTPException(status_code=400, detail="Invalid patient ID format")
         
     col = get_db().family_members
     patients_col = get_patients_collection()
@@ -572,9 +650,36 @@ async def add_patient_family_member(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient profile not found")
         
-    linked = await patients_col.find_one({"_id": linked_oid})
+    linked = None
+    linked_oid = None
+    
+    # 1. Try treating it as a direct MongoDB ObjectId
+    if len(payload.linked_patient_id) == 24 and all(c in "0123456789abcdefABCDEF" for c in payload.linked_patient_id):
+        try:
+            linked_oid = ObjectId(payload.linked_patient_id)
+            linked = await patients_col.find_one({"_id": linked_oid})
+        except:
+            pass
+
+    # 2. Try looking up by Phone, MRN, or ABHA
     if not linked:
-        raise HTTPException(status_code=404, detail="Linked family patient profile not found")
+        search_key = payload.linked_patient_id.strip()
+        linked = await patients_col.find_one({
+            "$or": [
+                {"phone": search_key},
+                {"mrn": search_key},
+                {"abha_number": search_key}
+            ],
+            "is_deleted": {"$ne": True}
+        })
+        if linked:
+            linked_oid = linked["_id"]
+
+    if not linked:
+        raise HTTPException(
+            status_code=404,
+            detail="No family profile found. Please enter a valid Mobile Number, MRN, or ABHA ID."
+        )
         
     existing = await col.find_one({"patient_id": patient_oid, "linked_patient_id": linked_oid})
     if existing:
@@ -593,7 +698,7 @@ async def add_patient_family_member(
         "id": str(res.inserted_id),
         "patient_id": patient_id,
         "relationship": payload.relationship,
-        "linked_patient_id": payload.linked_patient_id,
+        "linked_patient_id": str(linked_oid),
         "name": f"{linked.get('first_name', '')} {linked.get('last_name', '')}",
         "phone": linked.get("phone"),
         "gender": linked.get("gender"),
@@ -718,4 +823,122 @@ async def get_patient_timeline_history(patient_id: str, current_user: dict = Dep
         "labs": formatted_labs,
         "radiology": formatted_rad
     }
+
+@router.get("/me/family", response_model=List[FamilyMemberResponse])
+async def get_my_family_members(current_user: dict = Depends(get_current_user)):
+    patient_id = str(current_user["_id"])
+    return await get_patient_family_members(patient_id=patient_id, current_user=current_user)
+
+@router.post("/me/family", response_model=FamilyMemberResponse)
+async def add_my_family_member(payload: FamilyMemberCreate, current_user: dict = Depends(get_current_user)):
+    patient_id = str(current_user["_id"])
+    return await add_patient_family_member(patient_id=patient_id, payload=payload, current_user=current_user)
+
+@router.put("/me/family/{link_id}", response_model=FamilyMemberResponse)
+async def update_my_family_member(link_id: str, payload: FamilyMemberCreate, current_user: dict = Depends(get_current_user)):
+    patient_id = str(current_user["_id"])
+    try:
+        link_oid = ObjectId(link_id)
+        patient_oid = ObjectId(patient_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid ID formats")
+        
+    col = get_db().family_members
+    res = await col.find_one_and_update(
+        {"_id": link_oid, "patient_id": patient_oid},
+        {"$set": {"relationship": payload.relationship}},
+        return_document=ReturnDocument.AFTER
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Family member linkage not found")
+        
+    patients_col = get_patients_collection()
+    linked = await patients_col.find_one({"_id": res["linked_patient_id"]})
+    
+    doc_data = {
+        "id": str(res["_id"]),
+        "patient_id": str(res["patient_id"]),
+        "relationship": res["relationship"],
+        "linked_patient_id": str(res["linked_patient_id"]),
+    }
+    if linked:
+        doc_data["name"] = f"{linked.get('first_name', '')} {linked.get('last_name', '')}"
+        doc_data["phone"] = linked.get("phone")
+        doc_data["gender"] = linked.get("gender")
+        doc_data["dob"] = linked.get("dob")
+        
+    return doc_data
+
+@router.delete("/me/family/{link_id}")
+async def delete_my_family_member(link_id: str, current_user: dict = Depends(get_current_user)):
+    patient_id = str(current_user["_id"])
+    try:
+        link_oid = ObjectId(link_id)
+        patient_oid = ObjectId(patient_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid ID formats")
+        
+    col = get_db().family_members
+    res = await col.delete_one({"_id": link_oid, "patient_id": patient_oid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Family member linkage not found")
+    return {"status": "success", "message": "Family member link removed successfully"}
+
+@router.post("/me/documents/upload", response_model=PatientDocumentResponse)
+async def upload_my_document(
+    document_name: str = Form(...),
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+    patient_id = str(current_user["_id"])
+    return await upload_patient_document(
+        patient_id=patient_id,
+        document_name=document_name,
+        document_type=document_type,
+        file=file,
+        current_user=current_user
+    )
+
+@router.get("/me/documents", response_model=List[PatientDocumentResponse])
+async def get_my_documents(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied: patient role required")
+    patient_id = str(current_user["_id"])
+    return await list_patient_documents(patient_id=patient_id, current_user=current_user)
+
+@router.get("/me/documents/{doc_id}/preview")
+async def preview_my_document(
+    doc_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    if current_user.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Access denied")
+        
+    try:
+        doc_oid = ObjectId(doc_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid document ID format")
+        
+    col = get_db().patient_documents
+    doc = await col.find_one({"_id": doc_oid, "patient_id": ObjectId(current_user["_id"])})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found or access denied")
+        
+    file_id = None
+    if doc.get("file_id"):
+        file_id = str(doc["file_id"])
+    elif "files/" in doc.get("file_url", ""):
+        file_id = doc["file_url"].split("files/")[1].split("/")[0]
+        
+    if not file_id:
+        from api.storage import resolve_secure_file
+        filename = doc["file_url"].split("/")[-1]
+        return await resolve_secure_file(filename=filename)
+        
+    from api.storage import secure_file_preview_proxy
+    return await secure_file_preview_proxy(file_id=file_id, request=request, current_user=current_user)
 

@@ -135,7 +135,7 @@ def send_billing_notification(invoice_id: str):
 
 async def process_otp_notification(phone: str, otp: str):
     await connect_to_mongo()
-    sms_message = f"Your HMIS Portal verification OTP is {otp}. Valid for 5 minutes."
+    sms_message = f"Welcome to AGPK Academy login. Your verification code is {otp}. This OTP will expire in 5 minutes"
     print(f"\n[GATEWAY OUTBOUND SMS] To: {phone} | Content: {sms_message}\n")
 
 @celery_app.task(name="tasks.send_otp_notification")

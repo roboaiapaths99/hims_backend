@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from bson import ObjectId
 from datetime import datetime
 from typing import List, Optional
+from pydantic import BaseModel
 
 from database import (
     get_departments_collection, get_pricing_items_collection,
@@ -52,10 +53,16 @@ async def create_department(payload: DepartmentCreate, request: Request, current
     return DepartmentResponse(**doc)
 
 @router.get("/departments", response_model=List[DepartmentResponse])
-async def list_departments(current_user: dict = Depends(get_current_user)):
+async def list_departments(tenant_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     col = get_departments_collection()
     query = get_tenant_filter(current_user)
     
+    if current_user.get("role") == "patient" and tenant_id:
+        try:
+            query = {"tenant_id": ObjectId(tenant_id)}
+        except:
+            raise HTTPException(status_code=400, detail="Invalid tenant_id format")
+            
     docs = await col.find(query).to_list(None)
     result = []
     for doc in docs:
@@ -243,3 +250,129 @@ async def list_templates(template_type: Optional[str] = None, current_user: dict
             doc["branch_id"] = str(doc["branch_id"])
         result.append(TemplateResponse(**doc))
     return result
+
+# ------------------------------------------------------------------
+# PAYMENT SETTINGS WITH SECRETS VAULT
+# ------------------------------------------------------------------
+class PaymentSettingsUpdateRequest(BaseModel):
+    payu_enabled: bool = False
+    payu_merchant_key: Optional[str] = None
+    payu_merchant_salt: Optional[str] = None
+    payu_env: str = "test"
+    
+    razorpay_enabled: bool = False
+    razorpay_key_id: Optional[str] = None
+    razorpay_key_secret: Optional[str] = None
+    
+    stripe_enabled: bool = False
+    stripe_publishable_key: Optional[str] = None
+    stripe_secret_key: Optional[str] = None
+    
+    upi_enabled: bool = False
+    upi_vpa: Optional[str] = None
+    upi_merchant_name: Optional[str] = None
+    
+    cash_enabled: bool = True
+    card_enabled: bool = True
+
+@router.get("/payment-settings", dependencies=[Depends(require_role(["super_admin", "hospital_admin", "branch_admin"]))])
+async def get_payment_settings(current_user: dict = Depends(get_current_user)):
+    branch_id = current_user.get("branch_id")
+    if not branch_id:
+        raise HTTPException(status_code=400, detail="User must belong to a branch")
+        
+    from database import get_branches_collection
+    branches_col = get_branches_collection()
+    branch = await branches_col.find_one({"_id": ObjectId(branch_id)})
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branch record not found")
+        
+    pay_settings = branch.get("payment_settings") or {}
+    
+    from services.secrets_vault import get_branch_secrets
+    branch_secrets = await get_branch_secrets(branch_id)
+    
+    return {
+        "payu_enabled": pay_settings.get("payu_enabled", False),
+        "payu_merchant_key": pay_settings.get("payu_merchant_key", ""),
+        "payu_merchant_salt": "***" if branch_secrets.get("payu_merchant_salt") else "",
+        "payu_env": pay_settings.get("payu_env", "test"),
+        
+        "razorpay_enabled": pay_settings.get("razorpay_enabled", False),
+        "razorpay_key_id": pay_settings.get("razorpay_key_id", ""),
+        "razorpay_key_secret": "***" if branch_secrets.get("razorpay_key_secret") else "",
+        
+        "stripe_enabled": pay_settings.get("stripe_enabled", False),
+        "stripe_publishable_key": pay_settings.get("stripe_publishable_key", ""),
+        "stripe_secret_key": "***" if branch_secrets.get("stripe_secret_key") else "",
+        
+        "upi_enabled": pay_settings.get("upi_enabled", False),
+        "upi_vpa": pay_settings.get("upi_vpa", ""),
+        "upi_merchant_name": pay_settings.get("upi_merchant_name", ""),
+        
+        "cash_enabled": pay_settings.get("cash_enabled", True),
+        "card_enabled": pay_settings.get("card_enabled", True)
+    }
+
+@router.put("/payment-settings", dependencies=[Depends(require_role(["super_admin", "hospital_admin", "branch_admin"]))])
+async def update_payment_settings(
+    payload: PaymentSettingsUpdateRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    branch_id = current_user.get("branch_id")
+    tenant_id = current_user.get("tenant_id")
+    if not branch_id or not tenant_id:
+        raise HTTPException(status_code=400, detail="User must belong to a tenant and branch")
+        
+    from database import get_branches_collection
+    branches_col = get_branches_collection()
+    branch = await branches_col.find_one({"_id": ObjectId(branch_id)})
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branch record not found")
+        
+    public_settings = {
+        "payu_enabled": payload.payu_enabled,
+        "payu_merchant_key": payload.payu_merchant_key or "",
+        "payu_env": payload.payu_env,
+        "razorpay_enabled": payload.razorpay_enabled,
+        "razorpay_key_id": payload.razorpay_key_id or "",
+        "stripe_enabled": payload.stripe_enabled,
+        "stripe_publishable_key": payload.stripe_publishable_key or "",
+        "upi_enabled": payload.upi_enabled,
+        "upi_vpa": payload.upi_vpa or "",
+        "upi_merchant_name": payload.upi_merchant_name or "",
+        "cash_enabled": payload.cash_enabled,
+        "card_enabled": payload.card_enabled
+    }
+    
+    await branches_col.update_one(
+        {"_id": ObjectId(branch_id)},
+        {"$set": {"payment_settings": public_settings, "updated_at": datetime.utcnow()}}
+    )
+    
+    secrets_to_save = {}
+    if payload.payu_merchant_salt and payload.payu_merchant_salt != "***":
+        secrets_to_save["payu_merchant_salt"] = payload.payu_merchant_salt
+    if payload.razorpay_key_secret and payload.razorpay_key_secret != "***":
+        secrets_to_save["razorpay_key_secret"] = payload.razorpay_key_secret
+    if payload.stripe_secret_key and payload.stripe_secret_key != "***":
+        secrets_to_save["stripe_secret_key"] = payload.stripe_secret_key
+        
+    if secrets_to_save:
+        from services.secrets_vault import save_branch_secrets
+        await save_branch_secrets(branch_id, tenant_id, secrets_to_save)
+        
+    await create_audit_log(
+        user_id=str(current_user["_id"]),
+        user_name=current_user["name"],
+        action="PAYMENT_SETTINGS_UPDATED",
+        entity="branches",
+        entity_id=str(branch_id),
+        details={"payu_enabled": payload.payu_enabled, "razorpay_enabled": payload.razorpay_enabled, "stripe_enabled": payload.stripe_enabled, "upi_enabled": payload.upi_enabled},
+        ip_address=request.client.host if request.client else None,
+        tenant_id=ObjectId(tenant_id),
+        branch_id=ObjectId(branch_id)
+    )
+    
+    return {"status": "success", "message": "Payment settings updated successfully"}

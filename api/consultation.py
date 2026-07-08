@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
+from pydantic import BaseModel
 from bson import ObjectId
 from datetime import datetime
 from typing import List, Optional
@@ -9,9 +10,14 @@ from database import (
 )
 from middleware.auth import get_current_user, get_tenant_filter, inject_audit_fields
 from middleware.audit import create_audit_log
-from models.visit import VisitCreate, VisitResponse, VisitUpdate
+from models.visit import VisitCreate, VisitResponse, VisitUpdate, VisitAmendmentCreate
 
 router = APIRouter()
+
+
+class StartConsultationRequest(BaseModel):
+    """Validated payload for starting a new consultation visit."""
+    appointment_id: str
 
 # Simple ICD-10 common diagnostic repository
 ICD10_DB = [
@@ -42,7 +48,7 @@ async def search_icd10(q: Optional[str] = None):
     return matches[:10]
 
 @router.post("/visit/start", response_model=VisitResponse)
-async def start_consultation(payload: dict, request: Request, current_user: dict = Depends(get_current_user)):
+async def start_consultation(payload: StartConsultationRequest, request: Request, current_user: dict = Depends(get_current_user)):
     visits_col = get_visits_collection()
     appointments_col = get_appointments_collection()
     tokens_col = get_queue_tokens_collection()
@@ -50,13 +56,11 @@ async def start_consultation(payload: dict, request: Request, current_user: dict
     tenant_oid = current_user["tenant_id"]
     branch_oid = current_user["branch_id"]
     
-    app_id = payload.get("appointment_id")
-    if not app_id:
-        raise HTTPException(status_code=400, detail="appointment_id is required")
+    app_id = payload.appointment_id
         
     try:
         app_oid = ObjectId(app_id)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid appointment ID format")
         
     # Verify appointment
@@ -139,7 +143,7 @@ async def save_consultation(visit_id: str, payload: VisitUpdate, request: Reques
     
     try:
         visit_oid = ObjectId(visit_id)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid visit ID format")
         
     visit = await visits_col.find_one({"_id": visit_oid, "tenant_id": current_user["tenant_id"]})
@@ -187,7 +191,7 @@ async def complete_consultation(visit_id: str, payload: VisitUpdate, request: Re
     
     try:
         visit_oid = ObjectId(visit_id)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid visit ID format")
         
     visit = await visits_col.find_one({"_id": visit_oid, "tenant_id": current_user["tenant_id"]})
@@ -202,6 +206,10 @@ async def complete_consultation(visit_id: str, payload: VisitUpdate, request: Re
         
     update_data = payload.dict(exclude_unset=True)
     update_data["status"] = "completed"
+    update_data["is_finalized"] = True
+    update_data["locked"] = True
+    update_data["finalized_at"] = datetime.utcnow()
+    update_data["finalized_by"] = str(current_user["_id"])
     update_data["updated_at"] = datetime.utcnow()
     update_data["updated_by"] = current_user["_id"]
     
@@ -251,7 +259,7 @@ async def finalize_consultation(visit_id: str, request: Request, current_user: d
     
     try:
         visit_oid = ObjectId(visit_id)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid visit ID format")
         
     visit = await visits_col.find_one({"_id": visit_oid, "tenant_id": current_user["tenant_id"]})
@@ -269,7 +277,15 @@ async def finalize_consultation(visit_id: str, request: Request, current_user: d
         
     await visits_col.update_one(
         {"_id": visit_oid},
-        {"$set": {"is_finalized": True, "status": "completed", "updated_at": datetime.utcnow(), "updated_by": current_user["_id"]}}
+        {"$set": {
+            "is_finalized": True,
+            "locked": True,
+            "status": "finalized",
+            "finalized_at": datetime.utcnow(),
+            "finalized_by": str(current_user["_id"]),
+            "updated_at": datetime.utcnow(),
+            "updated_by": current_user["_id"]
+        }}
     )
     
     await appointments_col.update_one({"_id": visit["appointment_id"]}, {"$set": {"status": "completed", "updated_at": datetime.utcnow()}})
@@ -339,7 +355,7 @@ async def get_visit_details(visit_id: str, current_user: dict = Depends(get_curr
     
     try:
         visit_oid = ObjectId(visit_id)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid visit ID format")
         
     doc = await visits_col.find_one({"_id": visit_oid, "tenant_id": current_user["tenant_id"]})
@@ -354,13 +370,18 @@ async def get_visit_details(visit_id: str, current_user: dict = Depends(get_curr
     doc["appointment_id"] = str(doc["appointment_id"])
     return VisitResponse(**doc)
 
-@router.get("/patient/{patient_id}/history", response_model=List[VisitResponse])
-async def get_patient_consultation_history(patient_id: str, current_user: dict = Depends(get_current_user)):
+@router.get("/patient/{patient_id}/history")
+async def get_patient_consultation_history(
+    patient_id: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user)
+):
     visits_col = get_visits_collection()
     
     try:
         patient_oid = ObjectId(patient_id)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid patient ID")
         
     query = {
@@ -368,7 +389,8 @@ async def get_patient_consultation_history(patient_id: str, current_user: dict =
         "patient_id": patient_oid
     }
     
-    docs = await visits_col.find(query).sort("visit_date", -1).to_list(None)
+    total = await visits_col.count_documents(query)
+    docs = await visits_col.find(query).sort("visit_date", -1).skip((page - 1) * limit).limit(limit).to_list(limit)
     result = []
     for doc in docs:
         doc["id"] = str(doc["_id"])
@@ -378,4 +400,124 @@ async def get_patient_consultation_history(patient_id: str, current_user: dict =
         doc["doctor_id"] = str(doc["doctor_id"])
         doc["appointment_id"] = str(doc["appointment_id"])
         result.append(VisitResponse(**doc))
-    return result
+    return {"data": result, "total": total, "page": page, "limit": limit}
+
+
+# ─── AMENDMENT: Append corrections to a finalized consultation ───
+
+@router.post("/visit/{visit_id}/amend", response_model=VisitResponse)
+async def amend_consultation(
+    visit_id: str,
+    amendment: VisitAmendmentCreate,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Append a formal amendment to a finalized consultation visit.
+    
+    Only the original doctor or another authorised practitioner (role=doctor)
+    may amend.  The original record is never mutated – amendments are
+    appended to an `amendments[]` array and individually timestamped.
+    """
+    visits_col = get_visits_collection()
+
+    try:
+        visit_oid = ObjectId(visit_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid visit ID format")
+
+    visit = await visits_col.find_one({
+        "_id": visit_oid,
+        "tenant_id": current_user["tenant_id"]
+    })
+    if not visit:
+        raise HTTPException(status_code=404, detail="Consultation visit not found")
+
+    # Guard: only finalized visits may be amended
+    if not visit.get("is_finalized"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only finalized consultations can be amended. Save or complete the visit first."
+        )
+
+    # Guard: only doctors may amend
+    if current_user.get("role") not in ("doctor", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions. Only doctors and admins may amend clinical records."
+        )
+
+    amendment_doc = {
+        "id": str(ObjectId()),
+        "reason": amendment.reason,
+        "amended_symptoms": amendment.amended_symptoms,
+        "amended_clinical_notes": amendment.amended_clinical_notes,
+        "amended_diagnosis": amendment.amended_diagnosis,
+        "amended_treatment_plan": amendment.amended_treatment_plan,
+        "amended_by": str(current_user["_id"]),
+        "amended_by_name": current_user.get("name", "Unknown"),
+        "amended_at": datetime.utcnow()
+    }
+
+    # Atomically push into the amendments array
+    await visits_col.update_one(
+        {"_id": visit_oid},
+        {
+            "$push": {"amendments": amendment_doc},
+            "$set": {"updated_at": datetime.utcnow()}
+        }
+    )
+
+    # Audit log
+    await create_audit_log(
+        user_id=str(current_user["_id"]),
+        user_name=current_user["name"],
+        action="CLINICAL_VISIT_AMENDED",
+        entity="visits",
+        entity_id=visit_id,
+        details={
+            "amendment_id": amendment_doc["id"],
+            "reason": amendment.reason,
+            "patient_id": str(visit["patient_id"])
+        },
+        ip_address=request.client.host if request.client else None,
+        tenant_id=current_user["tenant_id"],
+        branch_id=current_user["branch_id"]
+    )
+
+    # Return the updated visit
+    updated = await visits_col.find_one({"_id": visit_oid})
+    updated["id"] = str(updated["_id"])
+    updated["tenant_id"] = str(updated["tenant_id"])
+    updated["branch_id"] = str(updated["branch_id"])
+    updated["patient_id"] = str(updated["patient_id"])
+    updated["doctor_id"] = str(updated["doctor_id"])
+    updated["appointment_id"] = str(updated["appointment_id"])
+    return updated
+
+
+@router.get("/visit/{visit_id}/amendments")
+async def get_visit_amendments(
+    visit_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Retrieve the amendment history for a specific consultation visit."""
+    visits_col = get_visits_collection()
+
+    try:
+        visit_oid = ObjectId(visit_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid visit ID format")
+
+    visit = await visits_col.find_one({
+        "_id": visit_oid,
+        "tenant_id": current_user["tenant_id"]
+    })
+    if not visit:
+        raise HTTPException(status_code=404, detail="Consultation visit not found")
+
+    amendments = visit.get("amendments", [])
+    # Serialize datetime objects for JSON
+    for a in amendments:
+        if isinstance(a.get("amended_at"), datetime):
+            a["amended_at"] = a["amended_at"].isoformat()
+    return {"visit_id": visit_id, "amendments": amendments, "total": len(amendments)}

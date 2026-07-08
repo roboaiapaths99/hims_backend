@@ -130,6 +130,7 @@ async def list_branches(tenant_id: Optional[str] = None, current_user: dict = De
     for doc in docs:
         doc["id"] = str(doc["_id"])
         doc["tenant_id"] = str(doc["tenant_id"])
+        doc["logo_url"] = doc.get("logo_url")
         result.append(BranchResponse(**doc))
     return result
 
@@ -226,17 +227,23 @@ async def list_users(branch_id: Optional[str] = None, current_user: dict = Depen
     users_col = get_users_collection()
     
     query = {}
-    if current_user["role"] != "super_admin":
-        query["tenant_id"] = current_user["tenant_id"]
-        # Branch Admins and below can only see users in their branch
-        if current_user["role"] in ["branch_admin", "doctor", "nurse", "pharmacist", "billing_staff"]:
-            query["branch_id"] = current_user["branch_id"]
-            
     if branch_id:
         try:
-            query["branch_id"] = ObjectId(branch_id)
+            branch_oid = ObjectId(branch_id)
+            query["branch_id"] = branch_oid
+            
+            # Resolve target tenant_id from the branch record
+            from database import get_branches_collection
+            branch = await get_branches_collection().find_one({"_id": branch_oid})
+            if branch:
+                query["tenant_id"] = branch["tenant_id"]
         except:
             raise HTTPException(status_code=400, detail="Invalid branch_id")
+    else:
+        if current_user["role"] != "super_admin":
+            query["tenant_id"] = current_user["tenant_id"]
+            if current_user["role"] in ["branch_admin", "doctor", "nurse", "pharmacist", "billing_staff"]:
+                query["branch_id"] = current_user["branch_id"]
             
     docs = await users_col.find(query).to_list(None)
     result = []
@@ -293,20 +300,75 @@ async def update_user(user_id: str, payload: UserUpdate, request: Request, curre
     
     return UserResponse(**updated)
 
+@router.post("/users/{user_id}/release-device", response_model=UserResponse, dependencies=[Depends(require_role(["super_admin", "hospital_admin", "branch_admin"]))])
+async def release_user_device(user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    users_col = get_users_collection()
+    try:
+        user_oid = ObjectId(user_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid user ID format")
+        
+    user = await users_col.find_one({"_id": user_oid})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    # Guard authorization check
+    if current_user["role"] != "super_admin":
+        if user.get("tenant_id") != current_user["tenant_id"]:
+            raise HTTPException(status_code=403, detail="Unauthorized access")
+            
+    await users_col.update_one({"_id": user_oid}, {"$set": {"device_id": None, "updated_at": datetime.utcnow()}})
+    
+    await create_audit_log(
+        user_id=str(current_user["_id"]),
+        user_name=current_user["name"],
+        action="USER_DEVICE_RELEASED",
+        entity="users",
+        entity_id=user_id,
+        details={"released_for": user["name"], "released_email": user["email"]},
+        ip_address=request.client.host if request.client else None,
+        tenant_id=user.get("tenant_id"),
+        branch_id=user.get("branch_id")
+    )
+    
+    updated = await users_col.find_one({"_id": user_oid})
+    updated["id"] = str(updated["_id"])
+    updated["tenant_id"] = str(updated["tenant_id"]) if updated.get("tenant_id") else None
+    updated["hospital_id"] = str(updated["hospital_id"]) if updated.get("hospital_id") else None
+    updated["branch_id"] = str(updated["branch_id"]) if updated.get("branch_id") else None
+    
+    return UserResponse(**updated)
+
 # ------------------------------------------------------------------
 # BRANCH PAYMENT CONFIGURATION SETTINGS
 # ------------------------------------------------------------------
 @router.get("/branches/settings/payments", response_model=BranchPaymentSettings)
-async def get_branch_payment_settings(current_user: dict = Depends(get_current_user)):
-    if not current_user.get("branch_id"):
-        raise HTTPException(status_code=400, detail="User is not associated with any branch")
+async def get_branch_payment_settings(request: Request, current_user: dict = Depends(get_current_user)):
+    branch_id_str = request.headers.get("x-branch-id") or request.headers.get("X-Branch-ID") or current_user.get("branch_id")
+    if not branch_id_str:
+        raise HTTPException(status_code=400, detail="User is not associated with any branch scope context")
+        
+    try:
+        branch_oid = ObjectId(str(branch_id_str))
+    except:
+        raise HTTPException(status_code=400, detail="Invalid branch ID format")
         
     branches_col = get_branches_collection()
-    branch = await branches_col.find_one({"_id": current_user["branch_id"]})
+    branch = await branches_col.find_one({"_id": branch_oid})
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")
         
     settings_dict = branch.get("payment_settings") or {}
+    
+    from services.secrets_vault import get_branch_secrets
+    branch_secrets = await get_branch_secrets(branch_oid)
+    if branch_secrets.get("payu_merchant_salt"):
+        settings_dict["payu_merchant_salt"] = "***"
+    if branch_secrets.get("razorpay_key_secret"):
+        settings_dict["razorpay_key_secret"] = "***"
+    if branch_secrets.get("stripe_secret_key"):
+        settings_dict["stripe_secret_key"] = "***"
+        
     return BranchPaymentSettings(**settings_dict)
 
 @router.put("/branches/settings/payments", response_model=BranchPaymentSettings, dependencies=[Depends(require_role(["super_admin", "hospital_admin", "branch_admin"]))])
@@ -315,18 +377,41 @@ async def update_branch_payment_settings(
     request: Request,
     current_user: dict = Depends(get_current_user)
 ):
-    if not current_user.get("branch_id"):
-        raise HTTPException(status_code=400, detail="User is not associated with any branch")
+    branch_id_str = request.headers.get("x-branch-id") or request.headers.get("X-Branch-ID") or current_user.get("branch_id")
+    if not branch_id_str:
+        raise HTTPException(status_code=400, detail="User is not associated with any branch scope context")
+        
+    try:
+        branch_oid = ObjectId(str(branch_id_str))
+    except:
+        raise HTTPException(status_code=400, detail="Invalid branch ID format")
         
     branches_col = get_branches_collection()
-    branch = await branches_col.find_one({"_id": current_user["branch_id"]})
+    branch = await branches_col.find_one({"_id": branch_oid})
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")
         
     settings_dict = payload.dict()
     
+    secrets_to_save = {}
+    if payload.payu_merchant_salt and payload.payu_merchant_salt != "***":
+        secrets_to_save["payu_merchant_salt"] = payload.payu_merchant_salt
+    if payload.razorpay_key_secret and payload.razorpay_key_secret != "***":
+        secrets_to_save["razorpay_key_secret"] = payload.razorpay_key_secret
+    if payload.stripe_secret_key and payload.stripe_secret_key != "***":
+        secrets_to_save["stripe_secret_key"] = payload.stripe_secret_key
+        
+    if secrets_to_save:
+        from services.secrets_vault import save_branch_secrets
+        await save_branch_secrets(branch_oid, current_user.get("tenant_id"), secrets_to_save)
+        
+    # Overwrite secrets on public settings dict
+    settings_dict["payu_merchant_salt"] = ""
+    settings_dict["razorpay_key_secret"] = ""
+    settings_dict["stripe_secret_key"] = ""
+    
     await branches_col.update_one(
-        {"_id": current_user["branch_id"]},
+        {"_id": branch_oid},
         {"$set": {"payment_settings": settings_dict, "updated_at": datetime.utcnow()}}
     )
     
@@ -335,23 +420,40 @@ async def update_branch_payment_settings(
         user_name=current_user["name"],
         action="BRANCH_PAYMENT_SETTINGS_UPDATED",
         entity="branches",
-        entity_id=str(current_user["branch_id"]),
+        entity_id=str(branch_oid),
         details={"payu_env": payload.payu_env, "cash_enabled": payload.cash_enabled},
         ip_address=request.client.host if request.client else None,
         tenant_id=current_user.get("tenant_id"),
-        branch_id=current_user.get("branch_id")
+        branch_id=branch_oid
     )
     
+    # Return payload with masked values for display consistency
+    if secrets_to_save or payload.payu_merchant_salt == "***":
+        payload.payu_merchant_salt = "***"
+    if secrets_to_save or payload.razorpay_key_secret == "***":
+        payload.razorpay_key_secret = "***"
+    if secrets_to_save or payload.stripe_secret_key == "***":
+        payload.stripe_secret_key = "***"
+        
     return payload
 
 
 @router.get("/branches/current/profile", response_model=BranchProfile)
-async def get_branch_profile(current_user: dict = Depends(get_current_user)):
-    if not current_user.get("branch_id"):
-        raise HTTPException(status_code=400, detail="User is not associated with any branch")
+async def get_branch_profile(request: Request, current_user: dict = Depends(get_current_user)):
+    branch_id = current_user.get("branch_id")
+    if not branch_id:
+        header_val = request.headers.get("x-branch-id") or request.headers.get("X-Branch-ID")
+        if header_val:
+            try:
+                branch_id = ObjectId(header_val)
+            except Exception:
+                pass
+                
+    if not branch_id:
+        raise HTTPException(status_code=400, detail="User is not associated with any branch, and no x-branch-id header was provided")
         
     branches_col = get_branches_collection()
-    branch = await branches_col.find_one({"_id": current_user["branch_id"]})
+    branch = await branches_col.find_one({"_id": branch_id})
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")
         
@@ -372,11 +474,20 @@ async def update_branch_profile(
     request: Request,
     current_user: dict = Depends(get_current_user)
 ):
-    if not current_user.get("branch_id"):
-        raise HTTPException(status_code=400, detail="User is not associated with any branch")
+    branch_id = current_user.get("branch_id")
+    if not branch_id:
+        header_val = request.headers.get("x-branch-id") or request.headers.get("X-Branch-ID")
+        if header_val:
+            try:
+                branch_id = ObjectId(header_val)
+            except Exception:
+                pass
+                
+    if not branch_id:
+        raise HTTPException(status_code=400, detail="User is not associated with any branch, and no x-branch-id header was provided")
         
     branches_col = get_branches_collection()
-    branch = await branches_col.find_one({"_id": current_user["branch_id"]})
+    branch = await branches_col.find_one({"_id": branch_id})
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")
         
@@ -384,7 +495,7 @@ async def update_branch_profile(
     update_dict["updated_at"] = datetime.utcnow()
     
     await branches_col.update_one(
-        {"_id": current_user["branch_id"]},
+        {"_id": branch_id},
         {"$set": update_dict}
     )
     

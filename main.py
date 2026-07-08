@@ -10,12 +10,18 @@ from middleware.rate_limit import limiter
 
 from config import settings
 from database import connect_to_mongo, close_mongo_connection, DatabaseUnavailableError
-from api import auth, org, saas, config, patient, abdm, appointment, vitals, consultation, lab, pharmacy, billing, payu, ot, telemedicine, notification, ai, reports, storage, ipd, tpa, radiology, referral, emergency, visitor_diet, feedback, payments, blood_bank, dms_integration
+from api import auth, org, saas, config, patient, abdm, appointment, doctor_schedule, prescription_template, investigation_package, vitals, consultation, lab, pharmacy, billing, payu, ot, telemedicine, notification, ai, reports, storage, ipd, tpa, radiology, referral, emergency, visitor_diet, feedback, payments, blood_bank, dms_integration, blood_bank_buzzer, sos_alerts
 
 
 # Socket.IO Realtime Server Setup
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
+sio = socketio.AsyncServer(
+    async_mode='asgi',
+    cors_allowed_origins=[o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+)
 sio_app = socketio.ASGIApp(sio)
+
+from services.websocket_service import RealtimeNotificationService
+RealtimeNotificationService.set_sio(sio)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -77,7 +83,7 @@ async def custom_http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         headers=getattr(exc, "headers", None),
-        content={"detail": detail}
+        content={"success": False, "detail": detail, "message": detail, "errors": []}
     )
 
 @app.exception_handler(RequestValidationError)
@@ -96,7 +102,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": friendly_msg}
+        content={"success": False, "detail": friendly_msg, "message": friendly_msg, "errors": []}
     )
 
 @app.exception_handler(Exception)
@@ -105,7 +111,7 @@ async def general_exception_handler(request: Request, exc: Exception):
     traceback.print_exc()
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "A system error occurred. The technical team has been notified. Please try again."}
+        content={"success": False, "detail": "A system error occurred. The technical team has been notified. Please try again.", "message": "A system error occurred. The technical team has been notified. Please try again.", "errors": []}
     )
 
 # CORS Policy configuration
@@ -125,9 +131,12 @@ app.include_router(config.router, prefix="/api/config", tags=["Hospital Configur
 app.include_router(patient.router, prefix="/api/patients", tags=["Patient Directory"])
 app.include_router(abdm.router, prefix="/api/abdm", tags=["ABDM Sandbox Integration"])
 app.include_router(appointment.router, prefix="/api/appointments", tags=["Appointment and Queue System"])
+app.include_router(doctor_schedule.router, prefix="/api/appointments", tags=["Doctor Schedule Management"])
 app.include_router(vitals.router, prefix="/api/vitals", tags=["Vitals Triage"])
 app.include_router(consultation.router, prefix="/api/consultation", tags=["EMR Doctor Consultation"])
+app.include_router(prescription_template.router, prefix="/api/consultation", tags=["Prescription Template Management"])
 app.include_router(lab.router, prefix="/api/labs", tags=["Lab Module"])
+app.include_router(investigation_package.router, prefix="/api/labs", tags=["Investigation & Health Packages"])
 app.include_router(pharmacy.router, prefix="/api/pharmacy", tags=["Pharmacy Module"])
 app.include_router(billing.router, prefix="/api/billing", tags=["Billing Module"])
 app.include_router(payu.router, prefix="/api/payu", tags=["PayU Payment Integration"])
@@ -146,6 +155,8 @@ app.include_router(emergency.router, prefix="/api/emergency", tags=["Emergency &
 app.include_router(visitor_diet.router, prefix="/api/ipd", tags=["Visitor Logs & Kitchen Service"])
 app.include_router(feedback.router, prefix="/api/portal", tags=["Patient Feedback Surveys"])
 app.include_router(blood_bank.router, prefix="/api/blood-bank", tags=["Blood Bank Module"])
+app.include_router(blood_bank_buzzer.router, prefix="/api/blood-bank", tags=["Blood Bank Module"])
+app.include_router(sos_alerts.router, prefix="/api/emergency", tags=["Emergency & Ambulance Module"])
 app.include_router(dms_integration.router)
 
 
@@ -154,6 +165,10 @@ os.makedirs("uploads", exist_ok=True)
 # Static mount removed for security hardening. File access must go through secure storage download endpoint.
 from api.storage import resolve_secure_file
 from typing import Optional
+
+@app.get("/uploads/{filename}", tags=["File Storage Services"])
+async def serve_file(filename: str, token: Optional[str] = None):
+    return await resolve_secure_file(filename, token)
 
 @app.get("/health", tags=["System Health"])
 async def health_check():
@@ -204,8 +219,14 @@ async def handle_join_branch(sid, branch_id):
     await sio.enter_room(sid, f"branch_{branch_id}")
     print(f"Client {sid} joined room branch_{branch_id}")
 
+@sio.on("join_user")
+async def handle_join_user(sid, user_id):
+    """Client registers to receive targeted user-specific updates"""
+    await sio.enter_room(sid, f"user_{user_id}")
+    print(f"Client {sid} joined room user_{user_id}")
+
 # ------------------------------------------------------------------
-# EXCEPTION OVERRIDES & CUSTOM HANDLERS
+# DATABASE UNAVAILABLE HANDLER
 # ------------------------------------------------------------------
 @app.exception_handler(DatabaseUnavailableError)
 async def db_unavailable_exception_handler(request: Request, exc: DatabaseUnavailableError):
@@ -216,70 +237,6 @@ async def db_unavailable_exception_handler(request: Request, exc: DatabaseUnavai
             "message": str(exc),
             "detail": str(exc),
             "status": "degraded"
-        }
-    )
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "success": False,
-            "message": exc.detail,
-            "detail": exc.detail,
-            "errors": []
-        }
-    )
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    import traceback
-    traceback.print_exc()
-    return JSONResponse(
-        status_code=500,
-        content={
-            "success": False,
-            "message": "An unexpected error occurred on the server.",
-            "detail": str(exc),
-            "errors": [str(exc)]
-        }
-    )
-
-@app.get("/health", tags=["System Health"])
-async def health_check():
-    return {"status": "healthy"}
-
-@app.get("/ready", tags=["System Health"])
-async def readiness_check():
-    mongo_status = "unreachable"
-    try:
-        from database import get_db
-        db = get_db()
-        await db.command("ping")
-        mongo_status = "connected"
-    except Exception as e:
-        mongo_status = f"error: {str(e)}"
-        
-    redis_status = "unreachable"
-    try:
-        from services.redis_client import redis_wrapper
-        if redis_wrapper.client:
-            redis_wrapper.client.ping()
-            redis_status = "connected"
-        else:
-            redis_status = "degraded (in-memory mock)"
-    except Exception as e:
-        redis_status = f"error: {str(e)}"
-        
-    is_ready = mongo_status == "connected"
-    status_code = status.HTTP_200_OK if is_ready else status.HTTP_503_SERVICE_UNAVAILABLE
-    
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "ready" if is_ready else "not_ready",
-            "mongodb": mongo_status,
-            "redis": redis_status
         }
     )
 

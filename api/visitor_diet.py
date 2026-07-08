@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from bson import ObjectId
 from datetime import datetime
 from typing import List, Optional
+from services.notification import create_user_notification
 
 from database import (
     get_db,
@@ -210,9 +211,46 @@ async def create_diet_order(
 
     patient_name, room_number = await _resolve_admission_patient(payload.admission_id, current_user["tenant_id"])
 
+    # Resolve admin configured meal pricing dynamically
+    resolved_price = payload.price
+    if not resolved_price or resolved_price <= 0.0:
+        try:
+            from database import get_pricing_items_collection
+            pricing_col = get_pricing_items_collection()
+            pricing_item = await pricing_col.find_one({
+                "tenant_id": current_user["tenant_id"],
+                "item_type": {"$in": ["diet", "catering"]},
+                "code": payload.meal_type.lower(),
+                "is_active": True
+            })
+            if not pricing_item:
+                pricing_item = await pricing_col.find_one({
+                    "tenant_id": current_user["tenant_id"],
+                    "item_type": {"$in": ["diet", "catering"]},
+                    "name": payload.meal_type.lower(),
+                    "is_active": True
+                })
+            
+            if pricing_item:
+                resolved_price = pricing_item["price"]
+            else:
+                # Fallback hardcoded defaults
+                meal_fallbacks = {
+                    "breakfast": 120.0,
+                    "lunch": 220.0,
+                    "dinner": 220.0,
+                    "snack": 60.0
+                }
+                resolved_price = meal_fallbacks.get(payload.meal_type.lower(), 150.0)
+        except Exception as e:
+            print(f"Error querying admin meal price: {e}")
+            resolved_price = 150.0
+
     doc = payload.dict()
+    doc["price"] = resolved_price
     doc["admission_id"] = adm_oid
     doc["status"] = "ordered"
+    doc["created_by_role"] = "patient" if current_user.get("role") == "patient" else "staff"
     inject_audit_fields(current_user, doc)
 
     res = await col.insert_one(doc)
@@ -222,6 +260,19 @@ async def create_diet_order(
     doc["admission_id"] = str(doc["admission_id"])
     doc["patient_name"] = patient_name
     doc["room_number"] = room_number
+    doc["created_by_role"] = doc.get("created_by_role", "staff")
+
+    try:
+        await create_user_notification(
+            tenant_id=ObjectId(doc["tenant_id"]),
+            branch_id=ObjectId(doc["branch_id"]),
+            user_id=adm["patient_id"],
+            title="Meal Request Registered",
+            message=f"Your request for {payload.meal_type.upper()} ({payload.diet_type.replace('_', ' ').title()} Diet) is registered.",
+            notification_type="info"
+        )
+    except Exception as ne:
+        print(f"Failed to create notification: {ne}")
 
     await create_audit_log(
         user_id=str(current_user["_id"]),
@@ -265,6 +316,7 @@ async def list_diet_orders(
         doc["patient_name"] = patient_name
         doc["room_number"] = room_number
 
+        doc["created_by_role"] = doc.get("created_by_role", "staff")
         result.append(DietOrderResponse(**doc))
     return result
 
@@ -311,6 +363,23 @@ async def update_diet_order(
     patient_name, room_number = await _resolve_admission_patient(admission_id_str, updated["tenant_id"])
     updated["patient_name"] = patient_name
     updated["room_number"] = room_number
+    updated["created_by_role"] = updated.get("created_by_role", "staff")
+
+    if update_data.get("status") == "delivered":
+        try:
+            admissions_col = get_ipd_admissions_collection()
+            adm = await admissions_col.find_one({"_id": ObjectId(admission_id_str)})
+            if adm:
+                await create_user_notification(
+                    tenant_id=ObjectId(updated["tenant_id"]),
+                    branch_id=ObjectId(updated["branch_id"]),
+                    user_id=adm["patient_id"],
+                    title="Meal Delivered! 🍽️",
+                    message=f"Your {updated.get('meal_type', '').upper()} has been prepared and delivered to Room {room_number}. {updated.get('special_instructions', '')}",
+                    notification_type="success"
+                )
+        except Exception as ne:
+            print(f"Failed to create update notification: {ne}")
 
     await create_audit_log(
         user_id=str(current_user["_id"]),

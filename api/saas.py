@@ -1,10 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Form
+from fastapi.responses import RedirectResponse, HTMLResponse
 from bson import ObjectId
 from datetime import datetime, timedelta
 from typing import Optional, List
 from pydantic import BaseModel
+import hashlib
 
 from database import (
+    get_db,
     get_tenants_collection,
     get_branches_collection,
     get_users_collection,
@@ -21,7 +24,7 @@ router = APIRouter()
 
 class SubscribeRequest(BaseModel):
     plan_id: str
-    gateway: str  # stripe, razorpay, sandbox
+    gateway: str  # stripe, razorpay, payu, sandbox
     billing_interval: str = "month"  # month, year
 
 class VerifySaaSPaymentRequest(BaseModel):
@@ -126,6 +129,7 @@ async def get_subscription_status(current_user: dict = Depends(get_current_user)
 @router.post("/subscription/subscribe")
 async def initialize_saas_subscribe(
     payload: SubscribeRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """Initializes checkout session parameters for subscription upgrade."""
@@ -167,8 +171,152 @@ async def initialize_saas_subscribe(
             "key_id": "rzp_test_saas_placeholder",
             "razorpay_order_id": f"order_sub_{ObjectId()}"
         })
+    elif gateway == "payu":
+        from config import settings
+        key = settings.PAYU_MERCHANT_KEY or "gtK42w"
+        salt = settings.PAYU_MERCHANT_SALT or "eCwWELSp"
+        env = settings.PAYU_ENV or "test"
+        
+        action_url = "https://secure.payu.in/_payment" if env == "production" else "https://test.payu.in/_payment"
+        base_url = str(request.base_url).rstrip('/')
+        surl = f"{base_url}/api/saas/subscription/payu-callback"
+        furl = f"{base_url}/api/saas/subscription/payu-callback"
+        
+        productinfo = f"SaaS Plan: {payload.plan_id}"
+        firstname = current_user.get("name", "Tenant Admin")
+        email = current_user.get("email", "admin@tenant.com")
+        
+        hash_sequence = f"{key}|{txnid}|{amount:.2f}|{productinfo}|{firstname}|{email}||||||||||{salt}"
+        hash_val = hashlib.sha512(hash_sequence.encode('utf-8')).hexdigest().lower()
+        
+        response_payload.update({
+            "key": key,
+            "action_url": action_url,
+            "surl": surl,
+            "furl": furl,
+            "hash": hash_val,
+            "productinfo": productinfo,
+            "firstname": firstname,
+            "email": email,
+            "phone": current_user.get("phone", "9999999999")
+        })
+
+    # Record SaaS transaction in database
+    db = get_db()
+    await db.saas_transactions.insert_one({
+        "tenant_id": tenant_oid,
+        "txnid": txnid,
+        "plan_id": payload.plan_id,
+        "billing_interval": payload.billing_interval,
+        "amount": amount,
+        "gateway": gateway,
+        "status": "pending",
+        "created_at": datetime.utcnow()
+    })
     
     return response_payload
+
+@router.post("/subscription/payu-callback")
+async def payu_saas_callback(request: Request):
+    """Processes Form POST callback from PayU for SaaS subscriptions, verifies hash, activates subscription, and redirects to frontend success page."""
+    form_data = await request.form()
+    data = dict(form_data)
+    
+    txnid = data.get("txnid")
+    status_val = data.get("status")
+    received_hash = data.get("hash")
+    
+    if not txnid or not status_val or not received_hash:
+        return HTMLResponse("<h3>Invalid SaaS Callback Request</h3>", status_code=400)
+        
+    db = get_db()
+    tx = await db.saas_transactions.find_one({"txnid": txnid})
+    if not tx:
+        return HTMLResponse("<h3>Transaction not found</h3>", status_code=404)
+        
+    # Verify hash
+    from config import settings
+    salt = settings.PAYU_MERCHANT_SALT or "eCwWELSp"
+    additional_charges = data.get("additionalCharges", "")
+    key = data.get("key", "")
+    firstname = data.get("firstname", "")
+    email = data.get("email", "")
+    productinfo = data.get("productinfo", "")
+    amount = data.get("amount", "")
+    
+    udf1 = data.get("udf1", "")
+    udf2 = data.get("udf2", "")
+    udf3 = data.get("udf3", "")
+    udf4 = data.get("udf4", "")
+    udf5 = data.get("udf5", "")
+    
+    if additional_charges:
+        hash_string = f"{additional_charges}|{salt}|{status_val}||||||{udf5}|{udf4}|{udf3}|{udf2}|{udf1}|{email}|{firstname}|{productinfo}|{amount}|{txnid}|{key}"
+    else:
+        hash_string = f"{salt}|{status_val}||||||{udf5}|{udf4}|{udf3}|{udf2}|{udf1}|{email}|{firstname}|{productinfo}|{amount}|{txnid}|{key}"
+        
+    calculated_hash = hashlib.sha512(hash_string.encode('utf-8')).hexdigest().lower()
+    
+    success_redirect_base = "https://hims.agpkacademy.in/saas/payment/success"
+    failure_redirect_base = "https://hims.agpkacademy.in/saas/payment/failure"
+    
+    if calculated_hash != received_hash.lower():
+        await db.saas_transactions.update_one({"_id": tx["_id"]}, {"$set": {"status": "failed", "error": "Signature mismatch", "updated_at": datetime.utcnow()}})
+        return RedirectResponse(url=f"{failure_redirect_base}?txnid={txnid}&message=Signature+mismatch", status_code=303)
+        
+    if status_val == "success":
+        # Check if already processed
+        if tx.get("status") == "success":
+            return RedirectResponse(url=f"{success_redirect_base}?txnid={txnid}", status_code=303)
+            
+        # Update transaction status
+        await db.saas_transactions.update_one({"_id": tx["_id"]}, {"$set": {"status": "success", "updated_at": datetime.utcnow()}})
+        
+        # Activate subscription
+        tenants_col = get_tenants_collection()
+        tenant = await tenants_col.find_one({"_id": tx["tenant_id"]})
+        plan = await get_plan_by_id(tx["plan_id"])
+        
+        # Log payment
+        payments_col = get_saas_payments_collection()
+        await payments_col.insert_one({
+            "tenant_id": tx["tenant_id"],
+            "plan_id": tx["plan_id"],
+            "amount_paid": tx["amount"],
+            "billing_interval": tx["billing_interval"],
+            "gateway": "PAYU",
+            "transaction_id": txnid,
+            "payment_date": datetime.utcnow()
+        })
+        
+        # Expiry logic
+        days_to_add = 30 if tx["billing_interval"] == "month" else 365
+        current_end = tenant.get("subscription_end")
+        if current_end and current_end > datetime.utcnow():
+            new_end = current_end + timedelta(days=days_to_add)
+        else:
+            new_end = datetime.utcnow() + timedelta(days=days_to_add)
+            
+        await tenants_col.update_one(
+            {"_id": tx["tenant_id"]},
+            {"$set": {
+                "status": "active",
+                "plan_id": tx["plan_id"],
+                "subscription_status": "active",
+                "subscription_start": datetime.utcnow(),
+                "subscription_end": new_end,
+                "billing_interval": tx["billing_interval"],
+                "max_branches": plan.get("max_branches", 1),
+                "max_staff": plan.get("max_staff", 5),
+                "max_patients": plan.get("max_patients", 100),
+                "updated_at": datetime.utcnow()
+            }}
+        )
+        
+        return RedirectResponse(url=f"{success_redirect_base}?txnid={txnid}", status_code=303)
+    else:
+        await db.saas_transactions.update_one({"_id": tx["_id"]}, {"$set": {"status": "failed", "updated_at": datetime.utcnow()}})
+        return RedirectResponse(url=f"{failure_redirect_base}?txnid={txnid}&message=Payment+failed", status_code=303)
 
 @router.post("/subscription/verify")
 async def verify_saas_subscription(

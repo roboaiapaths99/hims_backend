@@ -56,20 +56,10 @@ async def verify_abha(payload: VerifyAbhaRequest, current_user: dict = Depends(g
     abha_clean = payload.abha_number.replace("-", "").strip()
     
     if not token:
-        # Mock Sandbox Gateway Mode
-        # Generate and save a mock transaction ID
-        mock_txn_id = f"mock-txn-{ObjectId()}"
-        abha_sessions[abha_clean] = {
-            "txn_id": mock_txn_id,
-            "abha_number": payload.abha_number,
-            "timestamp": datetime.utcnow()
-        }
-        return {
-            "status": "success",
-            "message": "OTP has been sent to the mobile number registered with Aadhaar (Sandbox Mock Mode)",
-            "transaction_id": mock_txn_id,
-            "is_mock": True
-        }
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ABDM Identity Verification Gateway API credentials are not configured in system settings."
+        )
         
     # Real ABDM Integration
     headers = {
@@ -136,32 +126,10 @@ async def link_abha(payload: LinkAbhaRequest, current_user: dict = Depends(get_c
     token = await get_abdm_token()
     
     if not token or (session and "mock-txn" in session["txn_id"]):
-        # Mock Sandbox Gateway Completion Mode
-        # Validate sandbox mock OTP code (always verify '123456' or any 6-digit number)
-        if len(payload.otp) != 6:
-            raise HTTPException(status_code=400, detail="Invalid OTP length. Enter a 6-digit numeric OTP.")
-            
-        # Update Patient
-        update_data = {
-            "abha_number": payload.abha_number,
-            "abha_address": f"{patient['first_name'].lower()}{patient['last_name'].lower()}@abdm",
-            "consent_signed": True,
-            "updated_at": datetime.utcnow()
-        }
-        
-        await patients_col.update_one({"_id": patient_oid}, {"$set": update_data})
-        
-        # Clean up session
-        if abha_clean in abha_sessions:
-            del abha_sessions[abha_clean]
-            
-        return {
-            "status": "success",
-            "message": "ABHA verification completed successfully (Sandbox Mock Mode)",
-            "abha_number": payload.abha_number,
-            "abha_address": update_data["abha_address"],
-            "is_mock": True
-        }
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ABDM Identity Verification Gateway API credentials are not configured in system settings."
+        )
         
     # Real ABDM Integration OTP confirmation
     if not session:

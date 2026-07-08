@@ -28,9 +28,49 @@ async def check_doctor_availability(
     end_time: str,
     exclude_appointment_id: Optional[ObjectId] = None
 ) -> bool:
+    from database import get_doctor_schedules_collection, get_doctor_leaves_collection
+    schedules_col = get_doctor_schedules_collection()
+    leaves_col = get_doctor_leaves_collection()
     appointments_col = get_appointments_collection()
     
-    # Query overlap
+    # 1. Check if doctor is on leave
+    start_of_day = datetime.combine(app_date.date(), time.min)
+    end_of_day = datetime.combine(app_date.date(), time.max)
+    
+    leave_query = {
+        "doctor_id": doctor_id,
+        "tenant_id": tenant_id,
+        "status": "approved",
+        "start_date": {"$lte": end_of_day},
+        "end_date": {"$gte": start_of_day}
+    }
+    on_leave = await leaves_col.find_one(leave_query)
+    if on_leave:
+        return False
+        
+    # 2. Check weekly schedule
+    schedule = await schedules_col.find_one({"doctor_id": doctor_id, "tenant_id": tenant_id})
+    if schedule:
+        day_idx = app_date.weekday()
+        day_config = None
+        for ws in schedule.get("weekly_schedules", []):
+            if ws.get("day_of_week") == day_idx:
+                day_config = ws
+                break
+                
+        if not day_config or not day_config.get("is_available", True):
+            return False
+            
+        # Verify requested slot falls within at least one active shift window
+        fits_shift = False
+        for shift in day_config.get("shifts", []):
+            if start_time >= shift["start_time"] and end_time <= shift["end_time"]:
+                fits_shift = True
+                break
+        if not fits_shift:
+            return False
+            
+    # 3. Query overlap
     query = {
         "tenant_id": tenant_id,
         "branch_id": branch_id,
@@ -43,6 +83,37 @@ async def check_doctor_availability(
             # Case 2: End time is between another appointment
             {"start_time": {"$lt": end_time}, "end_time": {"$gte": end_time}},
             # Case 3: Another appointment is completely inside this slot
+            {"start_time": {"$gte": start_time}, "end_time": {"$lte": end_time}}
+        ]
+    }
+    
+    if exclude_appointment_id:
+        query["_id"] = {"$ne": exclude_appointment_id}
+        
+    overlap = await appointments_col.find_one(query)
+    return overlap is None
+
+# Helper to check patient slot availability
+async def check_patient_availability(
+    tenant_id: ObjectId, 
+    branch_id: ObjectId, 
+    patient_id: ObjectId, 
+    app_date: datetime, 
+    start_time: str, 
+    end_time: str,
+    exclude_appointment_id: Optional[ObjectId] = None
+) -> bool:
+    appointments_col = get_appointments_collection()
+    
+    query = {
+        "tenant_id": tenant_id,
+        "branch_id": branch_id,
+        "patient_id": patient_id,
+        "appointment_date": app_date,
+        "status": {"$ne": "cancelled"},
+        "$or": [
+            {"start_time": {"$lte": start_time}, "end_time": {"$gt": start_time}},
+            {"start_time": {"$lt": end_time}, "end_time": {"$gte": end_time}},
             {"start_time": {"$gte": start_time}, "end_time": {"$lte": end_time}}
         ]
     }
@@ -68,12 +139,73 @@ async def create_appointment(payload: AppointmentCreate, request: Request, curre
     tenant_oid = current_user["tenant_id"]
     branch_oid = current_user["branch_id"]
     
-    # Verify patient exists
     try:
         patient_oid = ObjectId(payload.patient_id)
     except:
         raise HTTPException(status_code=400, detail="Invalid patient ID")
-    patient = await patients_col.find_one({"_id": patient_oid, "tenant_id": tenant_oid})
+        
+    # Support cross-hospital target tenant mapping for patients
+    if current_user.get("role") == "patient":
+        if payload.tenant_id:
+            try:
+                target_tenant_oid = ObjectId(payload.tenant_id)
+            except:
+                raise HTTPException(status_code=400, detail="Invalid target tenant_id format")
+            
+            if payload.branch_id:
+                try:
+                    target_branch_oid = ObjectId(payload.branch_id)
+                except:
+                    raise HTTPException(status_code=400, detail="Invalid target branch_id format")
+            else:
+                target_branch_oid = branch_oid
+                
+            if target_tenant_oid != tenant_oid:
+                # Find patient details in their original home tenant
+                source_patient = await patients_col.find_one({"_id": patient_oid, "tenant_id": tenant_oid})
+                if not source_patient:
+                    raise HTTPException(status_code=404, detail="Source patient profile not found")
+                    
+                # Check if patient profile already exists in target tenant by phone
+                target_patient = await patients_col.find_one({"phone": source_patient["phone"], "tenant_id": target_tenant_oid})
+                if not target_patient:
+                    # Replicate basic patient profile to target tenant & branch
+                    from api.patient import generate_patient_mrn
+                    new_mrn = await generate_patient_mrn(target_tenant_oid, target_branch_oid)
+                    
+                    new_patient_doc = {
+                        "tenant_id": target_tenant_oid,
+                        "branch_id": target_branch_oid,
+                        "first_name": source_patient.get("first_name"),
+                        "last_name": source_patient.get("last_name"),
+                        "phone": source_patient.get("phone"),
+                        "email": source_patient.get("email"),
+                        "dob": source_patient.get("dob"),
+                        "gender": source_patient.get("gender"),
+                        "address": source_patient.get("address"),
+                        "emergency_contact_name": source_patient.get("emergency_contact_name", "Emergency"),
+                        "emergency_contact_phone": source_patient.get("emergency_contact_phone", "9999999999"),
+                        "mrn": new_mrn,
+                        "created_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow()
+                    }
+                    res_p = await patients_col.insert_one(new_patient_doc)
+                    patient_oid = res_p.inserted_id
+                    patient = new_patient_doc
+                else:
+                    patient_oid = target_patient["_id"]
+                    patient = target_patient
+                    
+                # Re-route local scoping parameters to the target tenant
+                tenant_oid = target_tenant_oid
+                branch_oid = target_branch_oid
+            else:
+                patient = await patients_col.find_one({"_id": patient_oid, "tenant_id": tenant_oid})
+        else:
+            patient = await patients_col.find_one({"_id": patient_oid, "tenant_id": tenant_oid})
+    else:
+        patient = await patients_col.find_one({"_id": patient_oid, "tenant_id": tenant_oid})
+        
     if not patient:
         raise HTTPException(status_code=404, detail="Patient profile not found")
         
@@ -98,7 +230,7 @@ async def create_appointment(payload: AppointmentCreate, request: Request, curre
     # Ensure date has no time parts (UTC midnight)
     app_date_utc = datetime.combine(payload.appointment_date.date(), time.min)
     
-    # Check Slot Availability
+    # Check Doctor Slot Availability
     is_available = await check_doctor_availability(
         tenant_oid, branch_oid, doctor_oid, app_date_utc, payload.start_time, payload.end_time
     )
@@ -106,6 +238,16 @@ async def create_appointment(payload: AppointmentCreate, request: Request, curre
         raise HTTPException(
             status_code=400,
             detail=f"The selected time slot ({payload.start_time} - {payload.end_time}) is already booked for this doctor."
+        )
+
+    # Check Patient Slot Availability (double booking prevention)
+    is_patient_available = await check_patient_availability(
+        tenant_oid, branch_oid, patient_oid, app_date_utc, payload.start_time, payload.end_time
+    )
+    if not is_patient_available:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The patient is already scheduled for another consultation during this time window ({payload.start_time} - {payload.end_time})."
         )
         
     doc = payload.dict()
@@ -115,6 +257,8 @@ async def create_appointment(payload: AppointmentCreate, request: Request, curre
     doc["appointment_date"] = app_date_utc
     
     inject_audit_fields(current_user, doc)
+    doc["tenant_id"] = tenant_oid
+    doc["branch_id"] = branch_oid
     
     res = await appointments_col.insert_one(doc)
     doc["id"] = str(res.inserted_id)

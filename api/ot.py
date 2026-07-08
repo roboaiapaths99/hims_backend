@@ -107,6 +107,7 @@ async def create_booking(
     end_buffer = payload.schedule_date + timedelta(hours=2)
     
     room_conflict = await ot_bookings_col.find_one({
+        "tenant_id": current_user["tenant_id"],
         "room_id": room_oid,
         "status": {"$ne": "cancelled"},
         "schedule_date": {"$gte": start_buffer, "$lte": end_buffer}
@@ -115,6 +116,7 @@ async def create_booking(
         raise HTTPException(status_code=400, detail="Room is already booked for another surgery in this time window")
         
     surgeon_conflict = await ot_bookings_col.find_one({
+        "tenant_id": current_user["tenant_id"],
         "surgeon_id": surgeon_oid,
         "status": {"$ne": "cancelled"},
         "schedule_date": {"$gte": start_buffer, "$lte": end_buffer}

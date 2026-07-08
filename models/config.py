@@ -24,7 +24,7 @@ class DepartmentResponse(DepartmentBase):
 class PricingItemBase(BaseModel):
     name: str
     code: str
-    item_type: str = Field(..., pattern="^(consultation|follow_up|lab_test|procedure|ot_charge|room_charge)$")
+    item_type: str = Field(..., pattern="^(consultation|follow_up|lab_test|procedure|ot_charge|room_charge|diet|catering)$")
     price: float = Field(..., gt=0)
     doctor_id: Optional[str] = None
     is_active: bool = Field(default=True)
@@ -65,6 +65,7 @@ class RoomBase(BaseModel):
     room_number: str
     room_type: str
     hourly_rate: float = Field(..., ge=0)
+    daily_rate: float = Field(default=0.0, ge=0)  # IPD daily bed charge tariff
     status: str = Field(default="available") # available, occupied, maintenance
 
 class RoomCreate(RoomBase):

@@ -13,6 +13,38 @@ from models.vitals import VitalsCreate, VitalsResponse
 
 router = APIRouter()
 
+def calculate_news_score(bp_sys: int, pulse: int, temp_f: float, spo2: int) -> int:
+    score = 0
+    if bp_sys <= 90 or bp_sys >= 220:
+        score += 3
+    elif (91 <= bp_sys <= 100) or (200 <= bp_sys <= 219):
+        score += 2
+    elif 101 <= bp_sys <= 110:
+        score += 1
+
+    if pulse <= 40 or pulse >= 131:
+        score += 3
+    elif 111 <= pulse <= 130:
+        score += 2
+    elif (41 <= pulse <= 50) or (91 <= pulse <= 110):
+        score += 1
+
+    if spo2 < 92:
+        score += 3
+    elif spo2 in (92, 93):
+        score += 2
+    elif spo2 in (94, 95):
+        score += 1
+
+    if temp_f <= 95.0 or temp_f >= 102.3:
+        score += 3
+    elif 100.5 <= temp_f <= 102.2:
+        score += 2
+    elif 95.1 <= temp_f <= 96.8:
+        score += 1
+
+    return score
+
 @router.post("", response_model=VitalsResponse)
 @router.post("/", response_model=VitalsResponse)
 async def record_vitals(payload: VitalsCreate, request: Request, current_user: dict = Depends(get_current_user)):
@@ -38,11 +70,24 @@ async def record_vitals(payload: VitalsCreate, request: Request, current_user: d
     height_m = payload.height / 100.0
     bmi = round(payload.weight / (height_m * height_m), 2)
     
+    # Calculate NEWS score
+    news = calculate_news_score(payload.bp_sys, payload.pulse, payload.temperature, payload.spo2)
+    
     doc = payload.dict()
     doc["patient_id"] = patient_oid
     doc["appointment_id"] = app_oid
     doc["bmi"] = bmi
+    doc["news_score"] = news
     
+    if news >= 7:
+        doc["triage_level"] = "red"
+    elif news >= 5:
+        doc["triage_level"] = "orange"
+    elif news >= 4:
+        doc["triage_level"] = "yellow"
+    else:
+        doc["triage_level"] = "green"
+        
     inject_audit_fields(current_user, doc)
     
     res = await vitals_col.insert_one(doc)
@@ -68,6 +113,9 @@ async def record_vitals(payload: VitalsCreate, request: Request, current_user: d
         app = await appointments_col.find_one({"_id": app_oid})
         if app:
             from services.notification_service import NotificationService
+            from database import get_patients_collection, get_users_collection
+            patients_col = get_patients_collection()
+            users_col = get_users_collection()
             patient = await patients_col.find_one({"_id": patient_oid})
             patient_name = f"{patient.get('first_name')} {patient.get('last_name')}" if patient else "A patient"
             
@@ -92,6 +140,13 @@ async def record_vitals(payload: VitalsCreate, request: Request, current_user: d
     sio = getattr(request.app.state, "sio", None)
     if sio:
         await sio.emit("queue.updated", {"branch_id": str(branch_oid)}, room=f"branch_{branch_oid}")
+        await sio.emit("vitals.updated", {"patient_id": str(patient_oid), "branch_id": str(branch_oid)}, room=f"branch_{branch_oid}")
+        if news >= 7:
+            await sio.emit("news.critical", {
+                "patient_id": str(patient_oid),
+                "news_score": news,
+                "branch_id": str(branch_oid)
+            }, room=f"branch_{branch_oid}")
         
     await create_audit_log(
         user_id=str(current_user["_id"]),
@@ -99,7 +154,7 @@ async def record_vitals(payload: VitalsCreate, request: Request, current_user: d
         action="VITALS_RECORDED",
         entity="vitals",
         entity_id=doc["id"],
-        details={"patient_id": payload.patient_id, "triage": payload.triage_level},
+        details={"patient_id": payload.patient_id, "triage": doc["triage_level"], "news_score": news},
         ip_address=request.client.host if request.client else None,
         tenant_id=tenant_oid,
         branch_id=branch_oid

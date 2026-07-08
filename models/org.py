@@ -64,6 +64,7 @@ class BranchCreate(BranchBase):
 class BranchResponse(BranchBase):
     id: str
     tenant_id: str
+    logo_url: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -104,6 +105,7 @@ class UserCreate(UserBase):
     tenant_id: Optional[str] = None
     hospital_id: Optional[str] = None
     branch_id: Optional[str] = None
+    device_id: Optional[str] = None
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -116,6 +118,7 @@ class UserResponse(UserBase):
     tenant_id: Optional[str] = None
     hospital_id: Optional[str] = None
     branch_id: Optional[str] = None
+    device_id: Optional[str] = None
     created_at: datetime
     last_login: Optional[datetime] = None
     login_count: Optional[int] = 0
@@ -127,6 +130,8 @@ class UserResponse(UserBase):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    tenant_id: Optional[str] = None
+    device_id: Optional[str] = None
 
 class TokenResponse(BaseModel):
     access_token: str

@@ -8,7 +8,7 @@ import uuid
 from jose import jwt
 
 from config import settings
-from database import get_stored_files_collection
+from database import get_stored_files_collection, get_db
 from middleware.auth import get_current_user, inject_audit_fields
 from middleware.audit import create_audit_log
 from models.storage import FileUploadResponse, FileDownloadResponse
@@ -228,6 +228,127 @@ async def view_file(
         file_path,
         media_type=doc["mime_type"],
         filename=doc["original_name"]
+    )
+
+@router.get("/files/{file_id}/download")
+async def secure_file_download_proxy(
+    file_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        file_oid = ObjectId(file_id)
+    except:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file ID format")
+        
+    files_col = get_stored_files_collection()
+    doc = await files_col.find_one({"_id": file_oid})
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File metadata record not found")
+        
+    # Scoping checks
+    if current_user.get("role") != "super_admin":
+        if str(doc.get("tenant_id")) != str(current_user.get("tenant_id")):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: tenant mismatch")
+        if doc.get("branch_id") and current_user.get("branch_id"):
+            if str(doc.get("branch_id")) != str(current_user.get("branch_id")):
+                if current_user.get("role") not in ["hospital_admin", "patient"]:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: branch mismatch")
+
+    if current_user.get("role") == "patient":
+        patient_docs_col = get_db().patient_documents
+        patient_doc = await patient_docs_col.find_one({
+            "$or": [
+                {"file_url": {"$regex": file_id}},
+                {"file_id": file_oid}
+            ]
+        })
+        if patient_doc and str(patient_doc.get("patient_id")) != str(current_user["_id"]):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: you do not own this document")
+
+    file_path = os.path.join("uploads", doc["filename"])
+    if not os.path.exists(file_path):
+        if "patients" in doc.get("filename", ""):
+            file_path = doc["filename"]
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Physical file not found on disk")
+            
+    await create_audit_log(
+        user_id=str(current_user["_id"]),
+        user_name=current_user.get("name", "User"),
+        action="FILE_DOWNLOADED",
+        entity="stored_files",
+        entity_id=file_id,
+        details={"original_name": doc.get("original_name")},
+        ip_address=request.client.host if request.client else None,
+        tenant_id=doc.get("tenant_id"),
+        branch_id=doc.get("branch_id")
+    )
+    
+    return FileResponse(
+        file_path,
+        media_type=doc.get("mime_type", "application/octet-stream"),
+        filename=doc.get("original_name")
+    )
+
+@router.get("/files/{file_id}/preview")
+async def secure_file_preview_proxy(
+    file_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        file_oid = ObjectId(file_id)
+    except:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file ID format")
+        
+    files_col = get_stored_files_collection()
+    doc = await files_col.find_one({"_id": file_oid})
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File metadata record not found")
+        
+    # Scoping checks
+    if current_user.get("role") != "super_admin":
+        if str(doc.get("tenant_id")) != str(current_user.get("tenant_id")):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: tenant mismatch")
+        if doc.get("branch_id") and current_user.get("branch_id"):
+            if str(doc.get("branch_id")) != str(current_user.get("branch_id")):
+                if current_user.get("role") not in ["hospital_admin", "patient"]:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: branch mismatch")
+
+    if current_user.get("role") == "patient":
+        patient_docs_col = get_db().patient_documents
+        patient_doc = await patient_docs_col.find_one({
+            "$or": [
+                {"file_url": {"$regex": file_id}},
+                {"file_id": file_oid}
+            ]
+        })
+        if patient_doc and str(patient_doc.get("patient_id")) != str(current_user["_id"]):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: you do not own this document")
+
+    file_path = os.path.join("uploads", doc["filename"])
+    if not os.path.exists(file_path):
+        if "patients" in doc.get("filename", ""):
+            file_path = doc["filename"]
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Physical file not found on disk")
+            
+    await create_audit_log(
+        user_id=str(current_user["_id"]),
+        user_name=current_user.get("name", "User"),
+        action="FILE_PREVIEWED",
+        entity="stored_files",
+        entity_id=file_id,
+        details={"original_name": doc.get("original_name")},
+        ip_address=request.client.host if request.client else None,
+        tenant_id=doc.get("tenant_id"),
+        branch_id=doc.get("branch_id")
+    )
+    
+    return FileResponse(
+        file_path,
+        media_type=doc.get("mime_type", "application/octet-stream")
     )
 
 from typing import Optional

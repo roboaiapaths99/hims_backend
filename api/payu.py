@@ -82,7 +82,10 @@ async def create_payment(
     pay_settings = branch.get("payment_settings", {}) if branch else {}
     
     key = pay_settings.get("payu_merchant_key") or settings.PAYU_MERCHANT_KEY or TEST_MERCHANT_KEY
-    salt = pay_settings.get("payu_merchant_salt") or settings.PAYU_MERCHANT_SALT or TEST_MERCHANT_SALT
+    
+    from services.secrets_vault import get_branch_secrets
+    branch_secrets = await get_branch_secrets(current_user.get("branch_id"))
+    salt = branch_secrets.get("payu_merchant_salt") or settings.PAYU_MERCHANT_SALT or TEST_MERCHANT_SALT
     env = pay_settings.get("payu_env") or settings.PAYU_ENV or "test"
     
     action_url = "https://secure.payu.in/_payment" if env == "production" else "https://test.payu.in/_payment"
@@ -164,7 +167,9 @@ async def payu_callback(request: Request):
     branches_col = get_branches_collection()
     branch = await branches_col.find_one({"_id": tx_doc.get("branch_id")}) if tx_doc.get("branch_id") else None
     pay_settings = branch.get("payment_settings", {}) if branch else {}
-    salt = pay_settings.get("payu_merchant_salt") or settings.PAYU_MERCHANT_SALT or TEST_MERCHANT_SALT
+    from services.secrets_vault import get_branch_secrets
+    branch_secrets = await get_branch_secrets(tx_doc.get("branch_id"))
+    salt = branch_secrets.get("payu_merchant_salt") or settings.PAYU_MERCHANT_SALT or TEST_MERCHANT_SALT
     
     # Calculate response hash
     additional_charges = data.get("additionalCharges", "")

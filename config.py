@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8002
-    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost:5173,http://127.0.0.1:5173,http://127.0.0.1:3000"
+    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost:5173,http://127.0.0.1:5173,http://127.0.0.1:3000,http://localhost:8083,http://127.0.0.1:8083"
 
     
     # PayU Configuration
@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     ABDM_CLIENT_SECRET: Optional[str] = None
     ABDM_GATEWAY_URL: str = "https://dev.abdm.gov.in"
     
+    # Sandbox Co GSTIN Verification Configuration
+    SANDBOX_CO_API_KEY: Optional[str] = None
+    
     # Gemini Configuration
     GEMINI_API_KEY: Optional[str] = None
     
@@ -64,6 +67,18 @@ class Settings(BaseSettings):
 
     # Expo Push Notifications
     EXPO_ACCESS_TOKEN: Optional[str] = None
+    
+    # MetaReach SMS Gateway Configuration
+    METAREACH_API_BASE_URL: str = "https://sms.metareach.in/vb/apikey.php"
+    METAREACH_API_KEY: Optional[str] = None
+    METAREACH_SENDER_ID: str = "HIMSOP"
+    METAREACH_TEMPLATE_ID: Optional[str] = None
+    METAREACH_OTP_ROUTE: str = "otp"
+    METAREACH_ENABLED: bool = False
+    
+    # Local Development Helpers (must be explicitly enabled via .env)
+    DEV_OTP_BYPASS: bool = False
+    DEV_FAKE_SMS: bool = False
     
     model_config = SettingsConfigDict(
         env_file=".env", 

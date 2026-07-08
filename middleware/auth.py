@@ -21,7 +21,9 @@ class CustomBcryptContext:
         return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 pwd_context = CustomBcryptContext()
-security = HTTPBearer()
+from typing import Optional
+
+security = HTTPBearer(auto_error=False)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
@@ -58,9 +60,20 @@ def create_refresh_token(data: dict, jti: Optional[str] = None) -> str:
 
 async def get_current_user(
     request: Request = None,
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ) -> dict:
-    token = credentials.credentials
+    token = None
+    if credentials:
+        token = credentials.credentials
+    elif request:
+        token = request.query_params.get("token")
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization token is missing."
+        )
+
     from services.redis_client import redis_wrapper
     if redis_wrapper.get(f"blocklist:{token}"):
         raise HTTPException(
