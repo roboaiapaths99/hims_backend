@@ -26,19 +26,19 @@ class Settings(BaseSettings):
     DMS_REQUEST_TIMEOUT_SECONDS: int = 15
     
     # Application settings
-    DEBUG: bool = True
-    ENVIRONMENT: str = "development"
+    DEBUG: bool = False
+    ENVIRONMENT: str = "production"
     API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8002
-    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost:5173,http://127.0.0.1:5173,http://127.0.0.1:3000,http://localhost:8083,http://127.0.0.1:8083"
+    API_PORT: int = 8070
+    ALLOWED_ORIGINS: str = "https://technulhims.technula.com,http://technulhims.technula.com,http://localhost:3000,http://localhost:3001,http://localhost:5173,http://127.0.0.1:5173,http://127.0.0.1:3000,http://localhost:8070,http://127.0.0.1:8070,http://localhost:8083,http://127.0.0.1:8083"
 
     
     # PayU Configuration
     PAYU_MERCHANT_KEY: Optional[str] = None
     PAYU_MERCHANT_SALT: Optional[str] = None
     PAYU_ENV: str = "test"
-    PAYU_SUCCESS_URL: str = "http://localhost:3000/payment/success"
-    PAYU_FAILURE_URL: str = "http://localhost:3000/payment/failure"
+    PAYU_SUCCESS_URL: str = "https://technulhims.technula.com/payment/success"
+    PAYU_FAILURE_URL: str = "https://technulhims.technula.com/payment/failure"
     
     # Jitsi Configuration
     JITSI_DOMAIN: str = "meet.jit.si"
