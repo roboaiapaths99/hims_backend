@@ -11,7 +11,14 @@ class DatabaseUnavailableError(RuntimeError):
 async def connect_to_mongo():
     global client, database
     try:
-        client = AsyncIOMotorClient(settings.MONGODB_URI)
+        client = AsyncIOMotorClient(
+            settings.MONGODB_URI,
+            maxPoolSize=50,
+            minPoolSize=5,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=20000
+        )
         try:
             database = client.get_default_database()
         except Exception:
