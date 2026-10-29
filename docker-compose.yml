@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # ─── Redis (Token blocklist, caching & message broker) ─────────────
   redis:
@@ -7,8 +5,6 @@ services:
     container_name: hmis-redis
     restart: unless-stopped
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
-    ports:
-      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     networks:
