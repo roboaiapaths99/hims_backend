@@ -1,9 +1,18 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
 from typing import Optional
 
 class Settings(BaseSettings):
     # Database
     MONGODB_URI: str = "mongodb://localhost:27017/hmis_db"
+    MONGO_URI: Optional[str] = None
+
+    @model_validator(mode="after")
+    def resolve_mongo_uri(self):
+        # Support MONGO_URI as alias for MONGODB_URI if MONGODB_URI is default/empty
+        if self.MONGO_URI and (self.MONGODB_URI == "mongodb://localhost:27017/hmis_db" or not self.MONGODB_URI):
+            self.MONGODB_URI = self.MONGO_URI
+        return self
     
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"

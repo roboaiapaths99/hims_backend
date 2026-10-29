@@ -8,7 +8,7 @@ services:
     restart: unless-stopped
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     networks:
@@ -27,7 +27,7 @@ services:
     container_name: hmis-backend-api
     restart: unless-stopped
     ports:
-      - "8070:8070"
+      - "127.0.0.1:8070:8070"
     env_file:
       - .env
     environment:
