@@ -249,6 +249,12 @@ async def send_patient_otp(payload: dict, request: Request):
     phone = payload.get("phone")
     if not phone:
         raise HTTPException(status_code=400, detail="Mobile phone number is required.")
+
+    # Google Play Store review test number — always succeeds with fixed OTP 123456
+    REVIEW_TEST_PHONE = "9999999999"
+    if phone == REVIEW_TEST_PHONE:
+        redis_wrapper.set(f"otp:{phone}", "123456", ex=300)
+        return {"message": "Verification code dispatched successfully", "phone": phone}
         
     # 1. Check temporary lockout (5 failures = 15 minute lock)
     failed_attempts = redis_wrapper.get(f"failed_attempts:{phone}")
@@ -318,8 +324,9 @@ async def login_patient_phone(payload: dict, request: Request):
         )
 
     stored_otp = redis_wrapper.get(f"otp:{phone}")
+    is_review_test = (phone == "9999999999" and otp == "123456")
     is_bypass = settings.DEV_OTP_BYPASS and otp == "123456"
-    if not is_bypass and (not stored_otp or stored_otp != otp):
+    if not is_review_test and not is_bypass and (not stored_otp or stored_otp != otp):
         # Increment failed attempts
         current_failed = redis_wrapper.get(f"failed_attempts:{phone}")
         new_failed = int(current_failed or 0) + 1

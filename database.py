@@ -31,6 +31,7 @@ async def connect_to_mongo():
         await create_indexes()
         await seed_saas_plans()
         await seed_drug_directory()
+        await seed_review_test_patient()
         return True
     except Exception as e:
         print(f"Error connecting to MongoDB: {e}")
@@ -493,6 +494,49 @@ async def seed_drug_directory():
             print("Seeded common drug master catalog database")
     except Exception as e:
         print(f"Error seeding drug directory: {e}")
+
+async def seed_review_test_patient():
+    """Ensure a verified test patient exists for Google Play Store review team (Phone: 9999999999, OTP: 123456)."""
+    try:
+        from bson import ObjectId
+        from datetime import datetime
+        db = get_db()
+        patients_col = db.patients
+        tenants_col = db.tenants
+        branches_col = db.branches
+
+        existing = await patients_col.find_one({"phone": "9999999999", "is_deleted": {"$ne": True}})
+        if not existing:
+            # Look up or use default tenant
+            tenant = await tenants_col.find_one({"status": "active"})
+            tenant_id = tenant["_id"] if tenant else ObjectId()
+            
+            branch = await branches_col.find_one({"tenant_id": tenant_id})
+            branch_id = branch["_id"] if branch else ObjectId()
+
+            test_patient = {
+                "first_name": "Google",
+                "last_name": "Reviewer",
+                "phone": "9999999999",
+                "email": "playreview@technula.com",
+                "dob": "1990-01-01",
+                "gender": "Other",
+                "address": "1600 Amphitheatre Pkwy, Mountain View, CA",
+                "emergency_contact_name": "Play Support",
+                "emergency_contact_phone": "9999999999",
+                "mrn": "MRN-PLAY-001",
+                "tenant_id": tenant_id,
+                "branch_id": branch_id,
+                "is_active": True,
+                "is_deleted": False,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            await patients_col.insert_one(test_patient)
+            print("Seeded Google Play review test patient profile (9999999999 / 123456)")
+    except Exception as e:
+        print(f"Error seeding review test patient: {e}")
+
 
 
 
